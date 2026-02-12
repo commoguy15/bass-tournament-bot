@@ -58,7 +58,6 @@ const {
   TextInputBuilder,
   TextInputStyle,
 } = require("discord.js");
-const { InteractionResponseFlags } = require("discord-api-types/v10");
 
 // -------------------- ENV CHECK --------------------
 const REQUIRED_ENVS = ["DISCORD_TOKEN", "CLIENT_ID", "GUILD_ID"];
@@ -188,10 +187,10 @@ async function registerCommands() {
 
 // -------------------- UTIL: EPHEMERAL REPLIES --------------------
 function eph(content) {
-  return { content, flags: InteractionResponseFlags.Ephemeral };
+  return { content, ephemeral: true };
 }
 function ephEmbeds(embeds) {
-  return { embeds, flags: InteractionResponseFlags.Ephemeral };
+  return { embeds, ephemeral: true };
 }
 
 // -------------------- DB HELPERS --------------------
@@ -1058,5 +1057,6 @@ client.on("interactionCreate", async (interaction) => {
 
 // -------------------- START BOT --------------------
 client.login(process.env.DISCORD_TOKEN);
+
 
 
