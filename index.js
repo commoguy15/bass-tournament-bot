@@ -1,24 +1,28 @@
 /**
- * Bass Tournament Discord Bot
- * Features:
- * - /setup sets review + leaderboard + results channels
- * - /start_tournament name: starts a new active tournament (auto-ends any prior active one)
- * - /end_tournament: ends active tournament, snapshots results, posts FINAL standings to results channel
- * - /weighin pounds photo notes: submits weigh-in (requires active tournament), admin approves/rejects via buttons
- * - Big Bass + Total Bag (Top 5) leaderboards per tournament
- * - /month_leaderboard (YYYY-MM optional): monthly standings (sum of bags + best big bass) from finalized tournaments
- * - /year_leaderboard: yearly standings (sum of bags + best big bass) from finalized tournaments
+ * Bass Tournament Discord Bot (UI Panel Edition)
  *
- * Requirements:
- * - Node.js 18+
- * - discord.js v14
- * - sqlite3
- * - dotenv
+ * What you asked for:
+ * ✅ Only ONE slash command: /panel (admin only)
+ * ✅ /panel posts an embed UI panel:
+ *    - Dropdown: Big Bass, Total Bag, Monthly, Yearly
+ *    - Buttons: Submit Weigh-in (modal), Start Tournament (modal, admin), End Tournament (admin)
+ * ✅ Weigh-in flow:
+ *    - User uploads photo FIRST in the channel
+ *    - User clicks "Submit Weigh-in"
+ *    - Modal asks for weight + notes
+ *    - Bot uses that user's MOST RECENT uploaded image (from this channel)
+ * ✅ No approve/reject.
+ * ✅ Persistent SQLite (use /data on Railway with a volume)
  *
- * .env:
+ * IMPORTANT:
+ * - This bot NEEDS Message Content access to detect image uploads.
+ *   In Discord Developer Portal -> Bot -> Privileged Gateway Intents:
+ *   ✅ Message Content Intent ON
+ *
+ * .env (Railway Variables):
  * DISCORD_TOKEN=...
  * CLIENT_ID=... (Application ID)
- * GUILD_ID=...  (Server ID)
+ * GUILD_ID=...  (Server ID - for guild command registration)
  */
 
 require("dotenv").config();
@@ -36,6 +40,10 @@ const {
   ButtonBuilder,
   ButtonStyle,
   EmbedBuilder,
+  StringSelectMenuBuilder,
+  ModalBuilder,
+  TextInputBuilder,
+  TextInputStyle,
 } = require("discord.js");
 
 // -------------------- ENV CHECK --------------------
@@ -48,21 +56,35 @@ for (const key of REQUIRED_ENVS) {
 }
 
 // -------------------- DB SETUP --------------------
-const db = new sqlite3.Database("/data/tournament.sqlite");
+// Use /data/tournament.sqlite on Railway if you mounted a Volume at /data
+const DB_PATH = process.env.DB_PATH || "/data/tournament.sqlite";
+const db = new sqlite3.Database(DB_PATH);
 
 function safeAlter(sql) {
-  db.run(sql, () => {
-    // ignore errors (e.g., column already exists)
-  });
+  db.run(sql, () => {});
 }
 
 db.serialize(() => {
   db.run(`
     CREATE TABLE IF NOT EXISTS config (
       guild_id TEXT PRIMARY KEY,
-      review_channel_id TEXT,
+      panel_channel_id TEXT,
       leaderboard_channel_id TEXT,
-      results_channel_id TEXT
+      results_channel_id TEXT,
+      bigbass_message_id TEXT,
+      totalbag_message_id TEXT
+    )
+  `);
+
+  db.run(`
+    CREATE TABLE IF NOT EXISTS uploads (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      guild_id TEXT NOT NULL,
+      channel_id TEXT NOT NULL,
+      user_id TEXT NOT NULL,
+      message_id TEXT NOT NULL,
+      image_url TEXT NOT NULL,
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
     )
   `);
 
@@ -70,11 +92,13 @@ db.serialize(() => {
     CREATE TABLE IF NOT EXISTS weighins (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       guild_id TEXT NOT NULL,
+      channel_id TEXT NOT NULL,
+      tournament_id INTEGER NOT NULL,
       user_id TEXT NOT NULL,
       weight_lbs REAL NOT NULL,
       photo_url TEXT NOT NULL,
       notes TEXT,
-      status TEXT NOT NULL DEFAULT 'pending',
+      status TEXT NOT NULL DEFAULT 'approved',
       created_at TEXT NOT NULL DEFAULT (datetime('now'))
     )
   `);
@@ -99,85 +123,36 @@ db.serialize(() => {
       big_bass REAL NOT NULL DEFAULT 0,
       total_bag REAL NOT NULL DEFAULT 0,
       fish_count INTEGER NOT NULL DEFAULT 0,
-      bag_rank INTEGER,
-      big_rank INTEGER,
       created_at TEXT NOT NULL DEFAULT (datetime('now')),
       UNIQUE (tournament_id, user_id)
     )
   `);
 
-  // migrations
-  safeAlter(`ALTER TABLE weighins ADD COLUMN tournament_id INTEGER`);
+  // migrations (if older DB exists)
+  safeAlter(`ALTER TABLE config ADD COLUMN panel_channel_id TEXT`);
+  safeAlter(`ALTER TABLE config ADD COLUMN leaderboard_channel_id TEXT`);
   safeAlter(`ALTER TABLE config ADD COLUMN results_channel_id TEXT`);
+  safeAlter(`ALTER TABLE config ADD COLUMN bigbass_message_id TEXT`);
+  safeAlter(`ALTER TABLE config ADD COLUMN totalbag_message_id TEXT`);
+  safeAlter(`ALTER TABLE uploads ADD COLUMN channel_id TEXT`);
+  safeAlter(`ALTER TABLE weighins ADD COLUMN channel_id TEXT`);
 });
 
 // -------------------- DISCORD CLIENT --------------------
 const client = new Client({
-  intents: [GatewayIntentBits.Guilds],
-  partials: [Partials.Channel],
+  intents: [
+    GatewayIntentBits.Guilds,
+    GatewayIntentBits.GuildMessages,
+    GatewayIntentBits.MessageContent, // REQUIRED for “upload photo first” flow
+  ],
+  partials: [Partials.Channel, Partials.Message],
 });
 
 // -------------------- SLASH COMMANDS --------------------
 const slashCommands = [
   new SlashCommandBuilder()
-    .setName("setup")
-    .setDescription("Set channels for review, leaderboard updates, and final results")
-    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
-    .addChannelOption((o) =>
-      o.setName("review_channel").setDescription("Where weigh-ins go for admin approval").setRequired(true)
-    )
-    .addChannelOption((o) =>
-      o.setName("leaderboard_channel").setDescription("Where leaderboard updates post").setRequired(true)
-    )
-    .addChannelOption((o) =>
-      o.setName("results_channel").setDescription("Where FINAL standings post on /end_tournament").setRequired(true)
-    ),
-
-  new SlashCommandBuilder()
-    .setName("start_tournament")
-    .setDescription("Start a new tournament (sets active flag; new event = clean board)")
-    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
-    .addStringOption((o) => o.setName("name").setDescription("Tournament name").setRequired(true)),
-
-  new SlashCommandBuilder()
-    .setName("end_tournament")
-    .setDescription("End the active tournament (locks submissions and posts final standings)")
-    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
-
-  new SlashCommandBuilder()
-    .setName("weighin")
-    .setDescription("Submit a weigh-in (photo required, active tournament required)")
-    .addNumberOption((o) =>
-      o.setName("pounds").setDescription("Weight in pounds (e.g., 5.62)").setRequired(true).setMinValue(0.01)
-    )
-    .addAttachmentOption((o) => o.setName("photo").setDescription("Weigh-in photo").setRequired(true))
-    .addStringOption((o) => o.setName("notes").setDescription("Optional notes").setRequired(false)),
-
-  new SlashCommandBuilder()
-    .setName("bigbass")
-    .setDescription("Show Big Bass leaderboard (best single fish)"),
-
-  new SlashCommandBuilder()
-    .setName("totalbag")
-    .setDescription("Show Total Bag leaderboard (top 5 fish total)"),
-
-  new SlashCommandBuilder()
-    .setName("month_leaderboard")
-    .setDescription("Overall leaderboard for a month (sum of tournament bags + best big bass)")
-    .addStringOption((o) =>
-      o
-        .setName("month")
-        .setDescription("Month in YYYY-MM (example: 2026-02). Leave blank for current month.")
-        .setRequired(false)
-    ),
-
-  new SlashCommandBuilder()
-    .setName("year_leaderboard")
-    .setDescription("Overall leaderboard for the year (sum of tournament bags + best big bass)"),
-
-  new SlashCommandBuilder()
-    .setName("reset_tournament_data")
-    .setDescription("DANGER: Clears all weigh-ins + tournaments + results for this server")
+    .setName("panel")
+    .setDescription("Post the Bass Tournament control panel (admin only)")
     .setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
 ].map((c) => c.toJSON());
 
@@ -199,18 +174,36 @@ function getConfig(guildId) {
   });
 }
 
-function upsertConfig(guildId, reviewChannelId, leaderboardChannelId, resultsChannelId) {
+function upsertConfig(guildId, patch) {
+  // patch can include any config fields
+  const fields = {
+    panel_channel_id: patch.panel_channel_id ?? null,
+    leaderboard_channel_id: patch.leaderboard_channel_id ?? null,
+    results_channel_id: patch.results_channel_id ?? null,
+    bigbass_message_id: patch.bigbass_message_id ?? null,
+    totalbag_message_id: patch.totalbag_message_id ?? null,
+  };
+
   return new Promise((resolve, reject) => {
     db.run(
       `
-      INSERT INTO config (guild_id, review_channel_id, leaderboard_channel_id, results_channel_id)
-      VALUES (?, ?, ?, ?)
+      INSERT INTO config (guild_id, panel_channel_id, leaderboard_channel_id, results_channel_id, bigbass_message_id, totalbag_message_id)
+      VALUES (?, ?, ?, ?, ?, ?)
       ON CONFLICT(guild_id) DO UPDATE SET
-        review_channel_id=excluded.review_channel_id,
-        leaderboard_channel_id=excluded.leaderboard_channel_id,
-        results_channel_id=excluded.results_channel_id
+        panel_channel_id=COALESCE(excluded.panel_channel_id, config.panel_channel_id),
+        leaderboard_channel_id=COALESCE(excluded.leaderboard_channel_id, config.leaderboard_channel_id),
+        results_channel_id=COALESCE(excluded.results_channel_id, config.results_channel_id),
+        bigbass_message_id=COALESCE(excluded.bigbass_message_id, config.bigbass_message_id),
+        totalbag_message_id=COALESCE(excluded.totalbag_message_id, config.totalbag_message_id)
       `,
-      [guildId, reviewChannelId, leaderboardChannelId, resultsChannelId],
+      [
+        guildId,
+        fields.panel_channel_id,
+        fields.leaderboard_channel_id,
+        fields.results_channel_id,
+        fields.bigbass_message_id,
+        fields.totalbag_message_id,
+      ],
       (err) => (err ? reject(err) : resolve())
     );
   });
@@ -256,24 +249,43 @@ function endTournament(guildId, tournamentId) {
   });
 }
 
-function insertWeighIn({ guildId, userId, tournamentId, weightLbs, photoUrl, notes }) {
+function insertUpload({ guildId, channelId, userId, messageId, imageUrl }) {
   return new Promise((resolve, reject) => {
     db.run(
-      `INSERT INTO weighins (guild_id, user_id, tournament_id, weight_lbs, photo_url, notes)
-       VALUES (?, ?, ?, ?, ?, ?)`,
-      [guildId, userId, tournamentId, weightLbs, photoUrl, notes || null],
-      function (err) {
-        if (err) return reject(err);
-        resolve(this.lastID);
-      }
+      `INSERT INTO uploads (guild_id, channel_id, user_id, message_id, image_url) VALUES (?, ?, ?, ?, ?)`,
+      [guildId, channelId, userId, messageId, imageUrl],
+      (err) => (err ? reject(err) : resolve())
     );
   });
 }
 
-function setWeighInStatus(id, status) {
+function getLatestUpload({ guildId, channelId, userId, maxMinutes = 120 }) {
+  // only accept uploads within last maxMinutes
   return new Promise((resolve, reject) => {
-    db.run(`UPDATE weighins SET status = ? WHERE id = ?`, [status, id], (err) =>
-      err ? reject(err) : resolve()
+    db.get(
+      `
+      SELECT * FROM uploads
+      WHERE guild_id = ? AND channel_id = ? AND user_id = ?
+        AND datetime(created_at) >= datetime('now', ?)
+      ORDER BY datetime(created_at) DESC
+      LIMIT 1
+      `,
+      [guildId, channelId, userId, `-${maxMinutes} minutes`],
+      (err, row) => (err ? reject(err) : resolve(row || null))
+    );
+  });
+}
+
+function insertWeighIn({ guildId, channelId, tournamentId, userId, weightLbs, photoUrl, notes }) {
+  return new Promise((resolve, reject) => {
+    db.run(
+      `INSERT INTO weighins (guild_id, channel_id, tournament_id, user_id, weight_lbs, photo_url, notes, status)
+       VALUES (?, ?, ?, ?, ?, ?, ?, 'approved')`,
+      [guildId, channelId, tournamentId, userId, weightLbs, photoUrl, notes || null],
+      function (err) {
+        if (err) return reject(err);
+        resolve(this.lastID);
+      }
     );
   });
 }
@@ -283,9 +295,6 @@ function formatLb(weight) {
 }
 
 // -------------------- LEADERBOARD QUERIES --------------------
-// Note: Total Bag uses a window function (ROW_NUMBER). Modern SQLite supports this.
-// If your environment has an old SQLite build and errors here, tell me and I’ll swap a fallback query.
-
 function getBigBassLeaderboard(guildId, tournamentId) {
   return new Promise((resolve, reject) => {
     db.all(
@@ -304,6 +313,7 @@ function getBigBassLeaderboard(guildId, tournamentId) {
 }
 
 function getTotalBagLeaderboard(guildId, tournamentId) {
+  // Top 5 fish total per angler (requires SQLite window functions)
   return new Promise((resolve, reject) => {
     db.all(
       `
@@ -326,147 +336,6 @@ function getTotalBagLeaderboard(guildId, tournamentId) {
       LIMIT 25
       `,
       [guildId, tournamentId],
-      (err, rows) => (err ? reject(err) : resolve(rows))
-    );
-  });
-}
-
-async function postLeaderboards(guild, leaderboardChannelId, tournamentId, tournamentName) {
-  const big = await getBigBassLeaderboard(guild.id, tournamentId);
-  const bag = await getTotalBagLeaderboard(guild.id, tournamentId);
-
-  const bigEmbed = new EmbedBuilder()
-    .setTitle(`🏆 Big Bass — ${tournamentName}`)
-    .setDescription(
-      big.length
-        ? big.map((r, i) => `**${i + 1}.** <@${r.user_id}> — **${formatLb(r.big_bass)} lbs**`).join("\n")
-        : "No approved weigh-ins yet."
-    )
-    .setTimestamp(new Date());
-
-  const bagEmbed = new EmbedBuilder()
-    .setTitle(`🎣 Total Bag (Top 5) — ${tournamentName}`)
-    .setDescription(
-      bag.length
-        ? bag
-            .map(
-              (r, i) =>
-                `**${i + 1}.** <@${r.user_id}> — **${formatLb(r.total_bag)} lbs** *(top ${r.fish_count} fish)*`
-            )
-            .join("\n")
-        : "No approved weigh-ins yet."
-    )
-    .setTimestamp(new Date());
-
-  const channel = await guild.channels.fetch(leaderboardChannelId);
-  if (channel) {
-    await channel.send({ embeds: [bigEmbed] });
-    await channel.send({ embeds: [bagEmbed] });
-  }
-}
-
-async function postFinalStandings(guild, resultsChannelId, tournamentId, tournamentName) {
-  const big = await getBigBassLeaderboard(guild.id, tournamentId);
-  const bag = await getTotalBagLeaderboard(guild.id, tournamentId);
-
-  const header = new EmbedBuilder()
-    .setTitle(`✅ FINAL RESULTS — ${tournamentName}`)
-    .setDescription("Tournament ended. Submissions are now locked.")
-    .setTimestamp(new Date());
-
-  const bigEmbed = new EmbedBuilder()
-    .setTitle("🏆 Big Bass (Final)")
-    .setDescription(
-      big.length
-        ? big.map((r, i) => `**${i + 1}.** <@${r.user_id}> — **${formatLb(r.big_bass)} lbs**`).join("\n")
-        : "No approved weigh-ins."
-    );
-
-  const bagEmbed = new EmbedBuilder()
-    .setTitle("🎣 Total Bag (Top 5) — Final")
-    .setDescription(
-      bag.length
-        ? bag
-            .map(
-              (r, i) =>
-                `**${i + 1}.** <@${r.user_id}> — **${formatLb(r.total_bag)} lbs** *(top ${r.fish_count} fish)*`
-            )
-            .join("\n")
-        : "No approved weigh-ins."
-    );
-
-  const channel = await guild.channels.fetch(resultsChannelId);
-  if (channel) {
-    await channel.send({ embeds: [header] });
-    await channel.send({ embeds: [bigEmbed] });
-    await channel.send({ embeds: [bagEmbed] });
-  }
-}
-
-// -------------------- SNAPSHOT RESULTS (for year/month stats) --------------------
-async function snapshotTournamentResults(guildId, tournamentId) {
-  const big = await getBigBassLeaderboard(guildId, tournamentId);
-  const bag = await getTotalBagLeaderboard(guildId, tournamentId);
-
-  const bigRank = new Map(big.map((r, i) => [r.user_id, i + 1]));
-  const bagRank = new Map(bag.map((r, i) => [r.user_id, i + 1]));
-
-  const users = new Set([...big.map((r) => r.user_id), ...bag.map((r) => r.user_id)]);
-
-  return new Promise((resolve, reject) => {
-    db.serialize(() => {
-      const stmt = db.prepare(`
-        INSERT INTO tournament_results (guild_id, tournament_id, user_id, big_bass, total_bag, fish_count, bag_rank, big_rank)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(tournament_id, user_id) DO UPDATE SET
-          big_bass=excluded.big_bass,
-          total_bag=excluded.total_bag,
-          fish_count=excluded.fish_count,
-          bag_rank=excluded.bag_rank,
-          big_rank=excluded.big_rank
-      `);
-
-      for (const userId of users) {
-        const bigRow = big.find((r) => r.user_id === userId);
-        const bagRow = bag.find((r) => r.user_id === userId);
-
-        stmt.run([
-          guildId,
-          tournamentId,
-          userId,
-          bigRow?.big_bass ?? 0,
-          bagRow?.total_bag ?? 0,
-          bagRow?.fish_count ?? 0,
-          bagRank.get(userId) ?? null,
-          bigRank.get(userId) ?? null,
-        ]);
-      }
-
-      stmt.finalize((err) => (err ? reject(err) : resolve()));
-    });
-  });
-}
-
-// -------------------- YEAR / MONTH LEADERBOARDS --------------------
-function getYearLeaderboard(guildId, yyyy) {
-  return new Promise((resolve, reject) => {
-    db.all(
-      `
-      SELECT
-        tr.user_id,
-        SUM(tr.total_bag) AS year_total_bag,
-        MAX(tr.big_bass) AS year_big_bass,
-        COUNT(DISTINCT tr.tournament_id) AS tournaments_count
-      FROM tournament_results tr
-      JOIN tournaments t ON t.id = tr.tournament_id
-      WHERE tr.guild_id = ?
-        AND t.ended_at IS NOT NULL
-        AND strftime('%Y', t.ended_at) = ?
-      GROUP BY tr.user_id
-      ORDER BY year_total_bag DESC, year_big_bass DESC
-      LIMIT 25
-      `,
-      [guildId, String(yyyy)],
       (err, rows) => (err ? reject(err) : resolve(rows))
     );
   });
@@ -496,7 +365,267 @@ function getMonthLeaderboard(guildId, yyyyMm) {
   });
 }
 
-// -------------------- DISCORD EVENTS --------------------
+function getYearLeaderboard(guildId, yyyy) {
+  return new Promise((resolve, reject) => {
+    db.all(
+      `
+      SELECT
+        tr.user_id,
+        SUM(tr.total_bag) AS year_total_bag,
+        MAX(tr.big_bass) AS year_big_bass,
+        COUNT(DISTINCT tr.tournament_id) AS tournaments_count
+      FROM tournament_results tr
+      JOIN tournaments t ON t.id = tr.tournament_id
+      WHERE tr.guild_id = ?
+        AND t.ended_at IS NOT NULL
+        AND strftime('%Y', t.ended_at) = ?
+      GROUP BY tr.user_id
+      ORDER BY year_total_bag DESC, year_big_bass DESC
+      LIMIT 25
+      `,
+      [guildId, String(yyyy)],
+      (err, rows) => (err ? reject(err) : resolve(rows))
+    );
+  });
+}
+
+async function snapshotTournamentResults(guildId, tournamentId) {
+  const big = await getBigBassLeaderboard(guildId, tournamentId);
+  const bag = await getTotalBagLeaderboard(guildId, tournamentId);
+
+  const users = new Set([...big.map((r) => r.user_id), ...bag.map((r) => r.user_id)]);
+
+  return new Promise((resolve, reject) => {
+    db.serialize(() => {
+      const stmt = db.prepare(`
+        INSERT INTO tournament_results (guild_id, tournament_id, user_id, big_bass, total_bag, fish_count)
+        VALUES (?, ?, ?, ?, ?, ?)
+        ON CONFLICT(tournament_id, user_id) DO UPDATE SET
+          big_bass=excluded.big_bass,
+          total_bag=excluded.total_bag,
+          fish_count=excluded.fish_count
+      `);
+
+      for (const userId of users) {
+        const bigRow = big.find((r) => r.user_id === userId);
+        const bagRow = bag.find((r) => r.user_id === userId);
+
+        stmt.run([
+          guildId,
+          tournamentId,
+          userId,
+          bigRow?.big_bass ?? 0,
+          bagRow?.total_bag ?? 0,
+          bagRow?.fish_count ?? 0,
+        ]);
+      }
+
+      stmt.finalize((err) => (err ? reject(err) : resolve()));
+    });
+  });
+}
+
+// -------------------- PANEL + MESSAGE MANAGEMENT --------------------
+function buildPanelEmbed(activeTournament) {
+  const title = activeTournament ? `🎣 Bass Tournament Panel — ${activeTournament.name}` : "🎣 Bass Tournament Panel";
+  const status = activeTournament ? "🟢 **Tournament is ACTIVE**" : "🔴 **No active tournament**";
+
+  return new EmbedBuilder()
+    .setTitle(title)
+    .setDescription(
+      [
+        status,
+        "",
+        "✅ **How to submit a weigh-in**",
+        "1) Upload your weigh-in photo in this channel",
+        "2) Click **Submit Weigh-in**",
+        "3) Enter weight + notes in the popup",
+        "",
+        "Use the dropdown to view leaderboards (Big Bass / Total Bag / Monthly / Yearly).",
+      ].join("\n")
+    )
+    .setTimestamp(new Date());
+}
+
+function buildPanelComponents(isAdmin) {
+  const select = new StringSelectMenuBuilder()
+    .setCustomId("panel_select")
+    .setPlaceholder("Choose a leaderboard to view…")
+    .addOptions(
+      { label: "🏆 Big Bass (Current Tournament)", value: "bigbass_current" },
+      { label: "🎣 Total Bag Top 5 (Current Tournament)", value: "totalbag_current" },
+      { label: "📆 Monthly Leaderboard", value: "monthly" },
+      { label: "📅 Yearly Leaderboard", value: "yearly" }
+    );
+
+  const row1 = new ActionRowBuilder().addComponents(select);
+
+  const row2 = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId("submit_weighin").setLabel("Submit Weigh-in").setStyle(ButtonStyle.Success),
+    new ButtonBuilder()
+      .setCustomId("start_tournament")
+      .setLabel("Start Tournament")
+      .setStyle(ButtonStyle.Primary)
+      .setDisabled(!isAdmin),
+    new ButtonBuilder()
+      .setCustomId("end_tournament")
+      .setLabel("End Tournament")
+      .setStyle(ButtonStyle.Danger)
+      .setDisabled(!isAdmin)
+  );
+
+  return [row1, row2];
+}
+
+function buildBigBassEmbed(tournamentName, rows) {
+  return new EmbedBuilder()
+    .setTitle(`🏆 Big Bass — ${tournamentName}`)
+    .setDescription(
+      rows.length
+        ? rows.map((r, i) => `**${i + 1}.** <@${r.user_id}> — **${formatLb(r.big_bass)} lbs**`).join("\n")
+        : "No weigh-ins yet."
+    )
+    .setTimestamp(new Date());
+}
+
+function buildTotalBagEmbed(tournamentName, rows) {
+  return new EmbedBuilder()
+    .setTitle(`🎣 Total Bag (Top 5) — ${tournamentName}`)
+    .setDescription(
+      rows.length
+        ? rows
+            .map(
+              (r, i) =>
+                `**${i + 1}.** <@${r.user_id}> — **${formatLb(r.total_bag)} lbs** *(top ${r.fish_count} fish)*`
+            )
+            .join("\n")
+        : "No weigh-ins yet."
+    )
+    .setTimestamp(new Date());
+}
+
+async function ensureLeaderboardMessages(guild, channelId, tournament) {
+  // Creates or reuses two messages in the leaderboard channel and stores their IDs,
+  // then edits them as the tournament updates.
+  const cfg = await getConfig(guild.id);
+
+  const channel = await guild.channels.fetch(channelId);
+  if (!channel) return null;
+
+  let bigMsg = null;
+  let bagMsg = null;
+
+  // Try fetch existing
+  if (cfg?.bigbass_message_id) {
+    try {
+      bigMsg = await channel.messages.fetch(cfg.bigbass_message_id);
+    } catch {}
+  }
+  if (cfg?.totalbag_message_id) {
+    try {
+      bagMsg = await channel.messages.fetch(cfg.totalbag_message_id);
+    } catch {}
+  }
+
+  // Create missing
+  if (!bigMsg) {
+    bigMsg = await channel.send({ embeds: [buildBigBassEmbed(tournament?.name || "Current", [])] });
+  }
+  if (!bagMsg) {
+    bagMsg = await channel.send({ embeds: [buildTotalBagEmbed(tournament?.name || "Current", [])] });
+  }
+
+  await upsertConfig(guild.id, {
+    leaderboard_channel_id: channelId,
+    bigbass_message_id: bigMsg.id,
+    totalbag_message_id: bagMsg.id,
+  });
+
+  return { bigMsg, bagMsg };
+}
+
+async function updateLeaderboardMessages(guild, tournament) {
+  const cfg = await getConfig(guild.id);
+  if (!cfg?.leaderboard_channel_id || !cfg?.bigbass_message_id || !cfg?.totalbag_message_id) return;
+
+  const channel = await guild.channels.fetch(cfg.leaderboard_channel_id);
+  if (!channel) return;
+
+  const bigRows = tournament ? await getBigBassLeaderboard(guild.id, tournament.id) : [];
+  const bagRows = tournament ? await getTotalBagLeaderboard(guild.id, tournament.id) : [];
+
+  try {
+    const bigMsg = await channel.messages.fetch(cfg.bigbass_message_id);
+    await bigMsg.edit({ embeds: [buildBigBassEmbed(tournament?.name || "No Active Tournament", bigRows)] });
+  } catch {}
+
+  try {
+    const bagMsg = await channel.messages.fetch(cfg.totalbag_message_id);
+    await bagMsg.edit({ embeds: [buildTotalBagEmbed(tournament?.name || "No Active Tournament", bagRows)] });
+  } catch {}
+}
+
+async function postFinalStandings(guild, resultsChannelId, tournament) {
+  const big = await getBigBassLeaderboard(guild.id, tournament.id);
+  const bag = await getTotalBagLeaderboard(guild.id, tournament.id);
+
+  const header = new EmbedBuilder()
+    .setTitle(`✅ FINAL RESULTS — ${tournament.name}`)
+    .setDescription("Tournament ended. Submissions are now locked.")
+    .setTimestamp(new Date());
+
+  const bigEmbed = new EmbedBuilder()
+    .setTitle("🏆 Big Bass (Final)")
+    .setDescription(
+      big.length
+        ? big.map((r, i) => `**${i + 1}.** <@${r.user_id}> — **${formatLb(r.big_bass)} lbs**`).join("\n")
+        : "No weigh-ins."
+    );
+
+  const bagEmbed = new EmbedBuilder()
+    .setTitle("🎣 Total Bag (Top 5) — Final")
+    .setDescription(
+      bag.length
+        ? bag
+            .map(
+              (r, i) =>
+                `**${i + 1}.** <@${r.user_id}> — **${formatLb(r.total_bag)} lbs** *(top ${r.fish_count} fish)*`
+            )
+            .join("\n")
+        : "No weigh-ins."
+    );
+
+  const channel = await guild.channels.fetch(resultsChannelId);
+  if (channel) {
+    await channel.send({ embeds: [header] });
+    await channel.send({ embeds: [bigEmbed] });
+    await channel.send({ embeds: [bagEmbed] });
+  }
+}
+
+// -------------------- CAPTURE IMAGE UPLOADS --------------------
+client.on("messageCreate", async (message) => {
+  try {
+    if (!message.guild) return;
+    if (message.author?.bot) return;
+
+    // Track only messages that contain at least one image attachment
+    const img = message.attachments.find((a) => (a.contentType || "").startsWith("image/"));
+    if (!img) return;
+
+    await insertUpload({
+      guildId: message.guild.id,
+      channelId: message.channel.id,
+      userId: message.author.id,
+      messageId: message.id,
+      imageUrl: img.url,
+    });
+  } catch (e) {
+    console.error("messageCreate upload tracking error:", e);
+  }
+});
+
+// -------------------- READY --------------------
 client.once("clientReady", async () => {
   console.log(`Logged in as ${client.user.tag}`);
   try {
@@ -506,171 +635,184 @@ client.once("clientReady", async () => {
   }
 });
 
+// -------------------- INTERACTIONS --------------------
 client.on("interactionCreate", async (interaction) => {
   try {
-    // -------------------- SLASH COMMANDS --------------------
+    // ---------- /panel ----------
     if (interaction.isChatInputCommand()) {
-      const { commandName } = interaction;
+      if (interaction.commandName !== "panel") return;
 
-      if (commandName === "setup") {
-        const reviewChannel = interaction.options.getChannel("review_channel", true);
-        const leaderboardChannel = interaction.options.getChannel("leaderboard_channel", true);
-        const resultsChannel = interaction.options.getChannel("results_channel", true);
+      // Save config: panel/leaderboard/results = this channel
+      await upsertConfig(interaction.guildId, {
+        panel_channel_id: interaction.channelId,
+        leaderboard_channel_id: interaction.channelId,
+        results_channel_id: interaction.channelId,
+      });
 
-        await upsertConfig(interaction.guildId, reviewChannel.id, leaderboardChannel.id, resultsChannel.id);
+      const active = await getActiveTournament(interaction.guildId);
 
-        return interaction.reply({
-          content: `✅ Setup saved.\nReview: ${reviewChannel}\nLeaderboard: ${leaderboardChannel}\nResults: ${resultsChannel}`,
-          ephemeral: true,
-        });
-      }
+      // Ensure leaderboard messages exist in this channel (so we edit instead of spamming)
+      await ensureLeaderboardMessages(interaction.guild, interaction.channelId, active || { name: "Current" });
+      await updateLeaderboardMessages(interaction.guild, active);
 
-      if (commandName === "start_tournament") {
-        const name = interaction.options.getString("name", true);
-        const newId = await startTournament(interaction.guildId, name);
+      const isAdmin = interaction.memberPermissions?.has(PermissionFlagsBits.Administrator);
 
-        return interaction.reply({
-          content: `✅ Started tournament: **${name}** (ID: ${newId}). New weigh-ins will count toward this event.`,
-          ephemeral: true,
-        });
-      }
+      const panel = await interaction.channel.send({
+        embeds: [buildPanelEmbed(active)],
+        components: buildPanelComponents(isAdmin),
+      });
 
-      if (commandName === "end_tournament") {
-        const active = await getActiveTournament(interaction.guildId);
+      return interaction.reply({
+        content: `✅ Panel posted in ${interaction.channel}.`,
+        ephemeral: true,
+      });
+    }
+
+    // ---------- Dropdown selection ----------
+    if (interaction.isStringSelectMenu()) {
+      if (interaction.customId !== "panel_select") return;
+
+      const active = await getActiveTournament(interaction.guildId);
+
+      const choice = interaction.values?.[0];
+
+      if (choice === "bigbass_current") {
         if (!active) {
-          return interaction.reply({ content: "❌ No active tournament to end.", ephemeral: true });
+          return interaction.reply({ content: "❌ No active tournament.", ephemeral: true });
         }
-
-        const config = await getConfig(interaction.guildId);
-        if (!config?.results_channel_id) {
-          return interaction.reply({ content: "❌ Missing results channel. Run `/setup` first.", ephemeral: true });
-        }
-
-        await endTournament(interaction.guildId, active.id);
-        await snapshotTournamentResults(interaction.guildId, active.id);
-        await postFinalStandings(interaction.guild, config.results_channel_id, active.id, active.name);
-
-        return interaction.reply({
-          content: `🛑 Ended tournament: **${active.name}**. Final standings posted to the results channel.`,
-          ephemeral: true,
-        });
-      }
-
-      if (commandName === "weighin") {
-        const config = await getConfig(interaction.guildId);
-        if (!config?.review_channel_id) {
-          return interaction.reply({
-            content: "❌ Bot isn’t set up yet. An admin needs to run `/setup` first.",
-            ephemeral: true,
-          });
-        }
-
-        const active = await getActiveTournament(interaction.guildId);
-        if (!active) {
-          return interaction.reply({
-            content: "❌ No active tournament right now. An admin needs to run `/start_tournament name:...`",
-            ephemeral: true,
-          });
-        }
-
-        const pounds = interaction.options.getNumber("pounds", true);
-        const photo = interaction.options.getAttachment("photo", true);
-        const notes = interaction.options.getString("notes", false);
-
-        if (!photo.contentType?.startsWith("image/")) {
-          return interaction.reply({ content: "❌ Please upload an image file.", ephemeral: true });
-        }
-
-        const weighInId = await insertWeighIn({
-          guildId: interaction.guildId,
-          userId: interaction.user.id,
-          tournamentId: active.id,
-          weightLbs: pounds,
-          photoUrl: photo.url,
-          notes,
-        });
-
-        const reviewChannel = await interaction.guild.channels.fetch(config.review_channel_id);
-
-        const embed = new EmbedBuilder()
-          .setTitle("🧾 Weigh-In Pending Review")
-          .addFields(
-            { name: "Tournament", value: `**${active.name}**`, inline: false },
-            { name: "Angler", value: `<@${interaction.user.id}>`, inline: true },
-            { name: "Weight", value: `**${formatLb(pounds)} lbs**`, inline: true },
-            { name: "Weigh-In ID", value: `#${weighInId}`, inline: true },
-            { name: "Notes", value: notes || "—", inline: false }
-          )
-          .setImage(photo.url)
-          .setTimestamp(new Date());
-
-        const row = new ActionRowBuilder().addComponents(
-          new ButtonBuilder().setCustomId(`approve:${weighInId}`).setLabel("Approve").setStyle(ButtonStyle.Success),
-          new ButtonBuilder().setCustomId(`reject:${weighInId}`).setLabel("Reject").setStyle(ButtonStyle.Danger)
-        );
-
-        await reviewChannel.send({ embeds: [embed], components: [row] });
-
-        return interaction.reply({
-          content: `✅ Submitted! Your weigh-in is pending admin approval. (ID #${weighInId})`,
-          ephemeral: true,
-        });
-      }
-
-      if (commandName === "bigbass") {
-        const active = await getActiveTournament(interaction.guildId);
-        if (!active) return interaction.reply({ content: "❌ No active tournament.", ephemeral: true });
-
         const rows = await getBigBassLeaderboard(interaction.guildId, active.id);
-
-        const embed = new EmbedBuilder()
-          .setTitle(`🏆 Big Bass — ${active.name}`)
-          .setDescription(
-            rows.length
-              ? rows.map((r, i) => `**${i + 1}.** <@${r.user_id}> — **${formatLb(r.big_bass)} lbs**`).join("\n")
-              : "No approved weigh-ins yet."
-          )
-          .setTimestamp(new Date());
-
-        return interaction.reply({ embeds: [embed] });
+        return interaction.reply({ embeds: [buildBigBassEmbed(active.name, rows)], ephemeral: true });
       }
 
-      if (commandName === "totalbag") {
-        const active = await getActiveTournament(interaction.guildId);
-        if (!active) return interaction.reply({ content: "❌ No active tournament.", ephemeral: true });
-
+      if (choice === "totalbag_current") {
+        if (!active) {
+          return interaction.reply({ content: "❌ No active tournament.", ephemeral: true });
+        }
         const rows = await getTotalBagLeaderboard(interaction.guildId, active.id);
+        return interaction.reply({ embeds: [buildTotalBagEmbed(active.name, rows)], ephemeral: true });
+      }
+
+      if (choice === "monthly") {
+        // Open a modal to ask YYYY-MM
+        const modal = new ModalBuilder().setCustomId("monthly_modal").setTitle("Monthly Leaderboard");
+        const monthInput = new TextInputBuilder()
+          .setCustomId("month")
+          .setLabel("Month (YYYY-MM) e.g., 2026-02")
+          .setStyle(TextInputStyle.Short)
+          .setRequired(true);
+
+        modal.addComponents(new ActionRowBuilder().addComponents(monthInput));
+        return interaction.showModal(modal);
+      }
+
+      if (choice === "yearly") {
+        const now = new Date();
+        const yyyy = now.getFullYear();
+        const rows = await getYearLeaderboard(interaction.guildId, yyyy);
 
         const embed = new EmbedBuilder()
-          .setTitle(`🎣 Total Bag (Top 5) — ${active.name}`)
+          .setTitle(`📅 Yearly Leaderboard — ${yyyy}`)
           .setDescription(
             rows.length
               ? rows
                   .map(
                     (r, i) =>
-                      `**${i + 1}.** <@${r.user_id}> — **${formatLb(r.total_bag)} lbs** *(top ${r.fish_count} fish)*`
+                      `**${i + 1}.** <@${r.user_id}> — **${formatLb(r.year_total_bag)} lbs** (bag) • **${formatLb(
+                        r.year_big_bass
+                      )} lbs** (big) • *${r.tournaments_count} events*`
                   )
                   .join("\n")
-              : "No approved weigh-ins yet."
+              : "No finalized tournaments this year yet."
           )
           .setTimestamp(new Date());
 
-        return interaction.reply({ embeds: [embed] });
+        return interaction.reply({ embeds: [embed], ephemeral: true });
+      }
+    }
+
+    // ---------- Buttons ----------
+    if (interaction.isButton()) {
+      const isAdmin =
+        interaction.memberPermissions?.has(PermissionFlagsBits.Administrator) ||
+        interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild);
+
+      if (interaction.customId === "submit_weighin") {
+        const active = await getActiveTournament(interaction.guildId);
+        if (!active) {
+          return interaction.reply({ content: "❌ No active tournament. Admin must start one first.", ephemeral: true });
+        }
+
+        const modal = new ModalBuilder().setCustomId("weighin_modal").setTitle("Submit Weigh-in");
+
+        const weightInput = new TextInputBuilder()
+          .setCustomId("weight")
+          .setLabel("Weight in pounds (example: 5.62)")
+          .setStyle(TextInputStyle.Short)
+          .setRequired(true);
+
+        const notesInput = new TextInputBuilder()
+          .setCustomId("notes")
+          .setLabel("Notes (optional)")
+          .setStyle(TextInputStyle.Paragraph)
+          .setRequired(false);
+
+        modal.addComponents(
+          new ActionRowBuilder().addComponents(weightInput),
+          new ActionRowBuilder().addComponents(notesInput)
+        );
+
+        return interaction.showModal(modal);
       }
 
-      if (commandName === "month_leaderboard") {
-        const input = interaction.options.getString("month", false);
+      if (interaction.customId === "start_tournament") {
+        if (!isAdmin) return interaction.reply({ content: "❌ Admins only.", ephemeral: true });
 
-        const now = new Date();
-        const current = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}`;
-        const yyyyMm = input || current;
+        const modal = new ModalBuilder().setCustomId("start_modal").setTitle("Start Tournament");
+        const nameInput = new TextInputBuilder()
+          .setCustomId("name")
+          .setLabel("Tournament name")
+          .setStyle(TextInputStyle.Short)
+          .setRequired(true);
 
+        modal.addComponents(new ActionRowBuilder().addComponents(nameInput));
+        return interaction.showModal(modal);
+      }
+
+      if (interaction.customId === "end_tournament") {
+        if (!isAdmin) return interaction.reply({ content: "❌ Admins only.", ephemeral: true });
+
+        const active = await getActiveTournament(interaction.guildId);
+        if (!active) {
+          return interaction.reply({ content: "❌ No active tournament to end.", ephemeral: true });
+        }
+
+        const cfg = await getConfig(interaction.guildId);
+        const resultsChannelId = cfg?.results_channel_id || interaction.channelId;
+
+        await endTournament(interaction.guildId, active.id);
+        await snapshotTournamentResults(interaction.guildId, active.id);
+        await postFinalStandings(interaction.guild, resultsChannelId, active);
+
+        // Update leaderboard messages to show final numbers (still safe)
+        await updateLeaderboardMessages(interaction.guild, active);
+
+        return interaction.reply({
+          content: `🛑 Ended **${active.name}**. Final standings posted.`,
+          ephemeral: true,
+        });
+      }
+    }
+
+    // ---------- Modals ----------
+    if (interaction.isModalSubmit()) {
+      // Monthly modal
+      if (interaction.customId === "monthly_modal") {
+        const yyyyMm = interaction.fields.getTextInputValue("month")?.trim();
         if (!/^\d{4}-\d{2}$/.test(yyyyMm)) {
           return interaction.reply({ content: "❌ Use YYYY-MM format (example: 2026-02).", ephemeral: true });
         }
 
         const rows = await getMonthLeaderboard(interaction.guildId, yyyyMm);
-
         const embed = new EmbedBuilder()
           .setTitle(`📆 Monthly Leaderboard — ${yyyyMm}`)
           .setDescription(
@@ -687,88 +829,103 @@ client.on("interactionCreate", async (interaction) => {
           )
           .setTimestamp(new Date());
 
-        return interaction.reply({ embeds: [embed] });
+        return interaction.reply({ embeds: [embed], ephemeral: true });
       }
 
-      if (commandName === "year_leaderboard") {
-        const now = new Date();
-        const yyyy = now.getFullYear();
+      // Start tournament modal
+      if (interaction.customId === "start_modal") {
+        const isAdmin =
+          interaction.memberPermissions?.has(PermissionFlagsBits.Administrator) ||
+          interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild);
+        if (!isAdmin) return interaction.reply({ content: "❌ Admins only.", ephemeral: true });
 
-        const rows = await getYearLeaderboard(interaction.guildId, yyyy);
+        const name = interaction.fields.getTextInputValue("name")?.trim();
+        if (!name) return interaction.reply({ content: "❌ Tournament name required.", ephemeral: true });
 
-        const embed = new EmbedBuilder()
-          .setTitle(`📅 Overall Leaderboard (Year) — ${yyyy}`)
-          .setDescription(
-            rows.length
-              ? rows
-                  .map(
-                    (r, i) =>
-                      `**${i + 1}.** <@${r.user_id}> — **${formatLb(r.year_total_bag)} lbs** (bag) • **${formatLb(
-                        r.year_big_bass
-                      )} lbs** (big) • *${r.tournaments_count} events*`
-                  )
-                  .join("\n")
-              : "No finalized tournaments yet. End a tournament to save results."
-          )
-          .setTimestamp(new Date());
+        await startTournament(interaction.guildId, name);
 
-        return interaction.reply({ embeds: [embed] });
+        // Ensure leaderboard messages exist (in configured channel)
+        const cfg = await getConfig(interaction.guildId);
+        const channelId = cfg?.leaderboard_channel_id || interaction.channelId;
+
+        const active = await getActiveTournament(interaction.guildId);
+        await ensureLeaderboardMessages(interaction.guild, channelId, active || { name });
+        await updateLeaderboardMessages(interaction.guild, active);
+
+        return interaction.reply({ content: `✅ Started tournament: **${name}**`, ephemeral: true });
       }
 
-      if (commandName === "reset_tournament_data") {
-        db.serialize(() => {
-          db.run(`DELETE FROM weighins WHERE guild_id = ?`, [interaction.guildId]);
-          db.run(`DELETE FROM tournament_results WHERE guild_id = ?`, [interaction.guildId]);
-          db.run(`DELETE FROM tournaments WHERE guild_id = ?`, [interaction.guildId]);
+      // Weigh-in modal
+      if (interaction.customId === "weighin_modal") {
+        const active = await getActiveTournament(interaction.guildId);
+        if (!active) {
+          return interaction.reply({ content: "❌ No active tournament.", ephemeral: true });
+        }
+
+        const weightRaw = interaction.fields.getTextInputValue("weight")?.trim();
+        const notes = interaction.fields.getTextInputValue("notes")?.trim() || null;
+
+        // Parse weight
+        const weight = Number(weightRaw);
+        if (!Number.isFinite(weight) || weight <= 0) {
+          return interaction.reply({ content: "❌ Weight must be a valid number (example: 5.62).", ephemeral: true });
+        }
+
+        // Find most recent upload from this user in this channel
+        const latest = await getLatestUpload({
+          guildId: interaction.guildId,
+          channelId: interaction.channelId,
+          userId: interaction.user.id,
+          maxMinutes: 180,
         });
 
-        return interaction.reply({ content: "🧹 Reset complete: cleared all tournament data for this server.", ephemeral: true });
-      }
-    }
-
-    // -------------------- BUTTONS (APPROVE / REJECT) --------------------
-    if (interaction.isButton()) {
-      if (!interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild)) {
-        return interaction.reply({ content: "❌ Admins only.", ephemeral: true });
-      }
-
-      const config = await getConfig(interaction.guildId);
-      const [action, idStr] = interaction.customId.split(":");
-      const weighInId = Number(idStr);
-
-      if (!Number.isFinite(weighInId)) {
-        return interaction.reply({ content: "❌ Invalid weigh-in ID.", ephemeral: true });
-      }
-
-      if (action === "approve") {
-        await setWeighInStatus(weighInId, "approved");
-        await interaction.reply({ content: `✅ Approved weigh-in #${weighInId}.`, ephemeral: true });
-
-        // Post updated leaderboards to leaderboard channel (current active tournament)
-        const active = await getActiveTournament(interaction.guildId);
-        if (active && config?.leaderboard_channel_id) {
-          await postLeaderboards(interaction.guild, config.leaderboard_channel_id, active.id, active.name);
+        if (!latest) {
+          return interaction.reply({
+            content:
+              "❌ I don’t see a recent weigh-in photo from you in this channel.\nUpload your photo first, then click **Submit Weigh-in** again.",
+            ephemeral: true,
+          });
         }
-        return;
-      }
 
-      if (action === "reject") {
-        await setWeighInStatus(weighInId, "rejected");
-        await interaction.reply({ content: `🗑️ Rejected weigh-in #${weighInId}.`, ephemeral: true });
-        return;
+        // Save weigh-in
+        await insertWeighIn({
+          guildId: interaction.guildId,
+          channelId: interaction.channelId,
+          tournamentId: active.id,
+          userId: interaction.user.id,
+          weightLbs: weight,
+          photoUrl: latest.image_url,
+          notes,
+        });
+
+        // Update persistent leaderboard messages
+        await updateLeaderboardMessages(interaction.guild, active);
+
+        const embed = new EmbedBuilder()
+          .setTitle("✅ Weigh-in Submitted")
+          .addFields(
+            { name: "Tournament", value: `**${active.name}**`, inline: false },
+            { name: "Angler", value: `<@${interaction.user.id}>`, inline: true },
+            { name: "Weight", value: `**${formatLb(weight)} lbs**`, inline: true },
+            { name: "Notes", value: notes || "—", inline: false }
+          )
+          .setImage(latest.image_url)
+          .setTimestamp(new Date());
+
+        return interaction.reply({ embeds: [embed], ephemeral: true });
       }
     }
   } catch (err) {
     console.error(err);
     if (interaction.isRepliable()) {
-      await interaction
-        .reply({ content: "❌ Something went wrong. Check the bot logs.", ephemeral: true })
-        .catch(() => {});
+      // Avoid double-reply errors
+      if (interaction.deferred || interaction.replied) {
+        return interaction.followUp({ content: "❌ Something went wrong. Check logs.", ephemeral: true }).catch(() => {});
+      }
+      await interaction.reply({ content: "❌ Something went wrong. Check logs.", ephemeral: true }).catch(() => {});
     }
   }
 });
 
 // -------------------- START BOT --------------------
 client.login(process.env.DISCORD_TOKEN);
-
-
