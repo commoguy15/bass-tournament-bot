@@ -493,21 +493,23 @@ function panelComponents(isAdmin) {
   return [
     new ActionRowBuilder().addComponents(
       new ButtonBuilder().setCustomId("submit_weighin").setLabel("Submit Weigh-in").setStyle(ButtonStyle.Success),
-      new ButtonBuilder()
-        .setCustomId("start_tournament")
-        .setLabel("Start Tournament")
-        .setStyle(ButtonStyle.Primary)
-        .setDisabled(!isAdmin),
-      new ButtonBuilder()
-        .setCustomId("end_tournament")
-        .setLabel("End Tournament")
-        .setStyle(ButtonStyle.Danger)
-        .setDisabled(!isAdmin),
-      new ButtonBuilder()
-        .setCustomId("set_channels")
-        .setLabel("Set Channels")
-        .setStyle(ButtonStyle.Secondary)
-        .setDisabled(!isAdmin)
+      const panelInput = new TextInputBuilder()
+  .setCustomId("panel_ch")
+  .setLabel("Panel channel (#channel or ID)")
+  .setStyle(TextInputStyle.Short)
+  .setRequired(true);
+
+const lbInput = new TextInputBuilder()
+  .setCustomId("lb_ch")
+  .setLabel("Leaderboard channel (#channel or ID)")
+  .setStyle(TextInputStyle.Short)
+  .setRequired(true);
+
+const resInput = new TextInputBuilder()
+  .setCustomId("res_ch")
+  .setLabel("Results channel (#channel or ID)")
+  .setStyle(TextInputStyle.Short)
+  .setRequired(true);
     ),
   ];
 }
@@ -1013,3 +1015,4 @@ client.on("interactionCreate", async (interaction) => {
 
 // -------------------- START BOT --------------------
 client.login(process.env.DISCORD_TOKEN);
+
