@@ -1,42 +1,42 @@
 /**
- * Bass Tournament Discord Bot — UI Panel + Auto-Updating Embeds (Separate Channels)
+ * Bass Tournament Discord Bot — UI Panel + Auto-Updating Embeds + Reset Buttons
  *
- * What this version does (per your request):
  * ✅ Only ONE slash command: /panel (admin only)
- * ✅ Panel UI (buttons) — NO slash commands for users
+ * ✅ No approve/reject
  * ✅ Weigh-in flow:
  *    1) User uploads photo FIRST in the PANEL channel
- *    2) User clicks "Submit Weigh-in" button
+ *    2) User clicks "Submit Weigh-in"
  *    3) Modal asks for weight + notes
- *    4) Bot uses that user's latest uploaded image in the panel channel (last 180 minutes)
+ *    4) Bot uses user's latest uploaded image in that panel channel (last 180 minutes)
  *
  * ✅ Separate channels:
  *    - PANEL channel (UI + weigh-in uploads)
  *    - BIG BASS channel (auto-updating embed)
- *    - TOP 5 / TOTAL BAG channel (auto-updating embed)
- *    - RESULTS channel (final standings + monthly winners + yearly winners embeds)
+ *    - TOP 5 channel (auto-updating embed)
+ *    - RESULTS channel (final standings + monthly/yearly winners embeds)
  *
- * ✅ No approve/reject
  * ✅ Auto-updating embeds (no “request” needed):
  *    - Big Bass (Current Tournament) in Big Bass channel
  *    - Total Bag (Top 5) (Current Tournament) in Top 5 channel
  *    - Monthly Winners (current month) in Results channel
  *    - Yearly Winners (current year) in Results channel
- * ✅ On End Tournament:
- *    - Snapshots results
- *    - Posts FINAL results embeds to Results channel
- *    - Updates Monthly/Yearly winners embeds
  *
- * IMPORTANT DISCORD SETTING:
+ * ✅ Admin reset buttons:
+ *    - Reset Monthly (clears finalized results for current month)
+ *    - Reset Yearly (clears finalized results for current year)
+ *
+ * ✅ Fixes: NO "ephemeral" option used (uses flags=64 instead)
+ *
+ * REQUIRED DISCORD SETTING:
  * Discord Developer Portal -> Bot -> Privileged Gateway Intents:
  * ✅ Message Content Intent ON
  *
- * .env / Railway Variables:
+ * Railway / .env:
  * DISCORD_TOKEN=...
- * CLIENT_ID=... (Application ID)
- * GUILD_ID=...  (Server ID)
+ * CLIENT_ID=...
+ * GUILD_ID=...
  * Optional:
- * DB_PATH=/data/tournament.sqlite  (defaults to /data/tournament.sqlite)
+ * DB_PATH=/data/tournament.sqlite (defaults to /data/tournament.sqlite)
  */
 
 require("dotenv").config();
@@ -58,6 +58,10 @@ const {
   TextInputBuilder,
   TextInputStyle,
 } = require("discord.js");
+
+// -------------------- CONSTANTS --------------------
+const EPHEMERAL_FLAG = 1 << 6; // 64
+const PHOTO_LOOKBACK_MINUTES = 180;
 
 // -------------------- ENV CHECK --------------------
 const REQUIRED_ENVS = ["DISCORD_TOKEN", "CLIENT_ID", "GUILD_ID"];
@@ -145,7 +149,7 @@ db.serialize(() => {
     )
   `);
 
-  // migrations for older DBs
+  // migrations (safe)
   safeAlter(`ALTER TABLE config ADD COLUMN panel_channel_id TEXT`);
   safeAlter(`ALTER TABLE config ADD COLUMN bigbass_channel_id TEXT`);
   safeAlter(`ALTER TABLE config ADD COLUMN top5_channel_id TEXT`);
@@ -161,11 +165,7 @@ db.serialize(() => {
 
 // -------------------- DISCORD CLIENT --------------------
 const client = new Client({
-  intents: [
-    GatewayIntentBits.Guilds,
-    GatewayIntentBits.GuildMessages,
-    GatewayIntentBits.MessageContent, // REQUIRED for tracking user photo uploads
-  ],
+  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent],
   partials: [Partials.Channel, Partials.Message],
 });
 
@@ -185,12 +185,12 @@ async function registerCommands() {
   console.log("Slash commands registered for the guild.");
 }
 
-// -------------------- UTIL: EPHEMERAL REPLIES --------------------
-function eph(content) {
-  return { content, ephemeral: true };
+// -------------------- EPHEMERAL HELPERS (NO DEPRECATED ephemeral OPTION) --------------------
+function ephContent(content) {
+  return { content, flags: EPHEMERAL_FLAG };
 }
 function ephEmbeds(embeds) {
-  return { embeds, ephemeral: true };
+  return { embeds, flags: EPHEMERAL_FLAG };
 }
 
 // -------------------- DB HELPERS --------------------
@@ -308,7 +308,7 @@ function insertUpload({ guildId, channelId, userId, messageId, imageUrl }) {
   });
 }
 
-function getLatestUpload({ guildId, channelId, userId, maxMinutes = 180 }) {
+function getLatestUpload({ guildId, channelId, userId, maxMinutes = PHOTO_LOOKBACK_MINUTES }) {
   return new Promise((resolve, reject) => {
     db.get(
       `
@@ -334,6 +334,44 @@ function insertWeighIn({ guildId, channelId, tournamentId, userId, weightLbs, ph
         if (err) return reject(err);
         resolve(this.lastID);
       }
+    );
+  });
+}
+
+function resetMonthlyResults(guildId, yyyyMm) {
+  return new Promise((resolve, reject) => {
+    db.run(
+      `
+      DELETE FROM tournament_results
+      WHERE guild_id = ?
+        AND tournament_id IN (
+          SELECT id FROM tournaments
+          WHERE guild_id = ?
+            AND ended_at IS NOT NULL
+            AND strftime('%Y-%m', ended_at) = ?
+        )
+      `,
+      [guildId, guildId, yyyyMm],
+      (err) => (err ? reject(err) : resolve())
+    );
+  });
+}
+
+function resetYearlyResults(guildId, yyyy) {
+  return new Promise((resolve, reject) => {
+    db.run(
+      `
+      DELETE FROM tournament_results
+      WHERE guild_id = ?
+        AND tournament_id IN (
+          SELECT id FROM tournaments
+          WHERE guild_id = ?
+            AND ended_at IS NOT NULL
+            AND strftime('%Y', ended_at) = ?
+        )
+      `,
+      [guildId, guildId, String(yyyy)],
+      (err) => (err ? reject(err) : resolve())
     );
   });
 }
@@ -391,7 +429,6 @@ function getTotalBagLeaderboard(guildId, tournamentId) {
 async function snapshotTournamentResults(guildId, tournamentId) {
   const big = await getBigBassLeaderboard(guildId, tournamentId);
   const bag = await getTotalBagLeaderboard(guildId, tournamentId);
-
   const users = new Set([...big.map((r) => r.user_id), ...bag.map((r) => r.user_id)]);
 
   return new Promise((resolve, reject) => {
@@ -530,6 +567,18 @@ function panelComponents(isAdmin) {
         .setStyle(ButtonStyle.Secondary)
         .setDisabled(!isAdmin)
     ),
+    new ActionRowBuilder().addComponents(
+      new ButtonBuilder()
+        .setCustomId("reset_month")
+        .setLabel("Reset Monthly")
+        .setStyle(ButtonStyle.Secondary)
+        .setDisabled(!isAdmin),
+      new ButtonBuilder()
+        .setCustomId("reset_year")
+        .setLabel("Reset Yearly")
+        .setStyle(ButtonStyle.Secondary)
+        .setDisabled(!isAdmin)
+    ),
   ];
 }
 
@@ -622,7 +671,7 @@ async function postFinalStandings(guild, resultsChannelId, tournament) {
         : "No weigh-ins."
     );
 
-  const channel = await guild.channels.fetch(resultsChannelId);
+  const channel = await guild.channels.fetch(resultsChannelId).catch(() => null);
   if (channel) {
     await channel.send({ embeds: [header] });
     await channel.send({ embeds: [bigEmbed] });
@@ -630,7 +679,7 @@ async function postFinalStandings(guild, resultsChannelId, tournament) {
   }
 }
 
-// -------------------- MESSAGE ENSURE/UPDATE (AUTO-UPDATING EMBEDS) --------------------
+// -------------------- AUTO-UPDATING EMBEDS (SEPARATE CHANNELS) --------------------
 async function ensureMessage(guild, channelId, existingMessageId, createEmbed) {
   const channel = await guild.channels.fetch(channelId).catch(() => null);
   if (!channel) return { messageId: null };
@@ -640,10 +689,9 @@ async function ensureMessage(guild, channelId, existingMessageId, createEmbed) {
       const msg = await channel.messages.fetch(existingMessageId);
       return { messageId: msg.id };
     } catch {
-      // fall through to create
+      // fall through
     }
   }
-
   const created = await channel.send({ embeds: [createEmbed()] });
   return { messageId: created.id };
 }
@@ -656,32 +704,20 @@ async function ensureAllAutoEmbeds(guild) {
   const yyyyMm = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}`;
   const yyyy = now.getFullYear();
 
-  const big = await ensureMessage(
-    guild,
-    cfg.bigbass_channel_id,
-    cfg.cur_bigbass_msg_id,
-    () => bigBassCurrentEmbed("No Active Tournament", [])
+  const big = await ensureMessage(guild, cfg.bigbass_channel_id, cfg.cur_bigbass_msg_id, () =>
+    bigBassCurrentEmbed("No Active Tournament", [])
   );
 
-  const top5 = await ensureMessage(
-    guild,
-    cfg.top5_channel_id,
-    cfg.cur_top5_msg_id,
-    () => top5Embed("No Active Tournament", [])
+  const top5 = await ensureMessage(guild, cfg.top5_channel_id, cfg.cur_top5_msg_id, () =>
+    top5Embed("No Active Tournament", [])
   );
 
-  const mon = await ensureMessage(
-    guild,
-    cfg.results_channel_id,
-    cfg.monthly_winners_msg_id,
-    () => monthlyWinnersEmbed(yyyyMm, null)
+  const mon = await ensureMessage(guild, cfg.results_channel_id, cfg.monthly_winners_msg_id, () =>
+    monthlyWinnersEmbed(yyyyMm, null)
   );
 
-  const yr = await ensureMessage(
-    guild,
-    cfg.results_channel_id,
-    cfg.yearly_winners_msg_id,
-    () => yearlyWinnersEmbed(yyyy, null)
+  const yr = await ensureMessage(guild, cfg.results_channel_id, cfg.yearly_winners_msg_id, () =>
+    yearlyWinnersEmbed(yyyy, null)
   );
 
   await upsertConfig(guild.id, {
@@ -709,28 +745,27 @@ async function updateAutoEmbeds(guild) {
   const monthW = await getMonthSummaryWinners(guild.id, yyyyMm).catch(() => null);
   const yearW = await getYearSummaryWinners(guild.id, yyyy).catch(() => null);
 
-  // Update Big Bass message
+  // Big Bass channel
   try {
     const ch = await guild.channels.fetch(cfg.bigbass_channel_id);
     const msg = await ch.messages.fetch(cfg.cur_bigbass_msg_id);
     await msg.edit({ embeds: [bigBassCurrentEmbed(active?.name || "No Active Tournament", bigRows)] });
   } catch {}
 
-  // Update Top 5 message
+  // Top 5 channel
   try {
     const ch = await guild.channels.fetch(cfg.top5_channel_id);
     const msg = await ch.messages.fetch(cfg.cur_top5_msg_id);
     await msg.edit({ embeds: [top5Embed(active?.name || "No Active Tournament", bagRows)] });
   } catch {}
 
-  // Update Monthly Winners message
+  // Results channel (monthly + yearly)
   try {
     const ch = await guild.channels.fetch(cfg.results_channel_id);
     const msg = await ch.messages.fetch(cfg.monthly_winners_msg_id);
     await msg.edit({ embeds: [monthlyWinnersEmbed(yyyyMm, monthW)] });
   } catch {}
 
-  // Update Yearly Winners message
   try {
     const ch = await guild.channels.fetch(cfg.results_channel_id);
     const msg = await ch.messages.fetch(cfg.yearly_winners_msg_id);
@@ -744,7 +779,6 @@ client.on("messageCreate", async (message) => {
     if (!message.guild) return;
     if (message.author?.bot) return;
 
-    // Only store first image attachment
     const img = message.attachments.find((a) => (a.contentType || "").startsWith("image/"));
     if (!img) return;
 
@@ -772,7 +806,6 @@ client.once("clientReady", async () => {
 
 // -------------------- HELPERS --------------------
 function parseChannelIdFromText(text) {
-  // accepts <#123> or 123
   const mention = text.match(/<#(\d{15,25})>/);
   if (mention) return mention[1];
   const raw = text.match(/\b(\d{15,25})\b/);
@@ -787,10 +820,10 @@ client.on("interactionCreate", async (interaction) => {
       interaction.memberPermissions?.has(PermissionFlagsBits.Administrator) ||
       interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild);
 
-    // /panel
+    // /panel (admin only)
     if (interaction.isChatInputCommand()) {
       if (interaction.commandName !== "panel") return;
-      if (!isAdmin) return interaction.reply(eph("❌ Admins only."));
+      if (!isAdmin) return interaction.reply(ephContent("❌ Admins only."));
 
       const existing = await getConfig(interaction.guildId);
 
@@ -805,17 +838,15 @@ client.on("interactionCreate", async (interaction) => {
       const cfg = await getConfig(interaction.guildId);
       const active = await getActiveTournament(interaction.guildId);
 
-      // Ensure + update auto embeds
       await ensureAllAutoEmbeds(interaction.guild);
       await updateAutoEmbeds(interaction.guild);
 
-      // Post panel
       await interaction.channel.send({
         embeds: [panelEmbed(active, cfg)],
         components: panelComponents(true),
       });
 
-      return interaction.reply(eph("✅ Panel posted."));
+      return interaction.reply(ephContent("✅ Panel posted."));
     }
 
     // Buttons
@@ -824,7 +855,7 @@ client.on("interactionCreate", async (interaction) => {
       const active = await getActiveTournament(interaction.guildId);
 
       if (interaction.customId === "set_channels") {
-        if (!isAdmin) return interaction.reply(eph("❌ Admins only."));
+        if (!isAdmin) return interaction.reply(ephContent("❌ Admins only."));
 
         const modal = new ModalBuilder().setCustomId("set_channels_modal").setTitle("Set Channels");
 
@@ -863,15 +894,33 @@ client.on("interactionCreate", async (interaction) => {
         return interaction.showModal(modal);
       }
 
-      if (interaction.customId === "submit_weighin") {
-        // Only allow weigh-ins in panel channel
-        if (cfg?.panel_channel_id && interaction.channelId !== cfg.panel_channel_id) {
-          return interaction.reply(eph(`❌ Submit weigh-ins in <#${cfg.panel_channel_id}>`));
-        }
+      if (interaction.customId === "reset_month") {
+        if (!isAdmin) return interaction.reply(ephContent("❌ Admins only."));
 
-        if (!active) {
-          return interaction.reply(eph("❌ No active tournament. Admin must start one first."));
+        const now = new Date();
+        const yyyyMm = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}`;
+
+        await resetMonthlyResults(interaction.guildId, yyyyMm);
+        await updateAutoEmbeds(interaction.guild);
+
+        return interaction.reply(ephContent(`✅ Monthly results reset for **${yyyyMm}**.`));
+      }
+
+      if (interaction.customId === "reset_year") {
+        if (!isAdmin) return interaction.reply(ephContent("❌ Admins only."));
+
+        const yyyy = new Date().getFullYear();
+        await resetYearlyResults(interaction.guildId, yyyy);
+        await updateAutoEmbeds(interaction.guild);
+
+        return interaction.reply(ephContent(`✅ Yearly results reset for **${yyyy}**.`));
+      }
+
+      if (interaction.customId === "submit_weighin") {
+        if (cfg?.panel_channel_id && interaction.channelId !== cfg.panel_channel_id) {
+          return interaction.reply(ephContent(`❌ Submit weigh-ins in <#${cfg.panel_channel_id}>`));
         }
+        if (!active) return interaction.reply(ephContent("❌ No active tournament. Admin must start one first."));
 
         const modal = new ModalBuilder().setCustomId("weighin_modal").setTitle("Submit Weigh-in");
 
@@ -896,7 +945,7 @@ client.on("interactionCreate", async (interaction) => {
       }
 
       if (interaction.customId === "start_tournament") {
-        if (!isAdmin) return interaction.reply(eph("❌ Admins only."));
+        if (!isAdmin) return interaction.reply(ephContent("❌ Admins only."));
 
         const modal = new ModalBuilder().setCustomId("start_tournament_modal").setTitle("Start Tournament");
 
@@ -911,8 +960,8 @@ client.on("interactionCreate", async (interaction) => {
       }
 
       if (interaction.customId === "end_tournament") {
-        if (!isAdmin) return interaction.reply(eph("❌ Admins only."));
-        if (!active) return interaction.reply(eph("❌ No active tournament to end."));
+        if (!isAdmin) return interaction.reply(ephContent("❌ Admins only."));
+        if (!active) return interaction.reply(ephContent("❌ No active tournament to end."));
 
         const resultsChannelId = cfg?.results_channel_id || interaction.channelId;
 
@@ -920,10 +969,9 @@ client.on("interactionCreate", async (interaction) => {
         await snapshotTournamentResults(interaction.guildId, active.id);
         await postFinalStandings(interaction.guild, resultsChannelId, active);
 
-        // Update auto embeds after ending (monthly/yearly winners)
         await updateAutoEmbeds(interaction.guild);
 
-        return interaction.reply(eph(`🛑 Ended **${active.name}**. Finals posted.`));
+        return interaction.reply(ephContent(`🛑 Ended **${active.name}**. Finals posted.`));
       }
     }
 
@@ -933,20 +981,15 @@ client.on("interactionCreate", async (interaction) => {
       const active = await getActiveTournament(interaction.guildId);
 
       if (interaction.customId === "set_channels_modal") {
-        if (!isAdmin) return interaction.reply(eph("❌ Admins only."));
+        if (!isAdmin) return interaction.reply(ephContent("❌ Admins only."));
 
-        const panelText = interaction.fields.getTextInputValue("panel_ch")?.trim();
-        const bigText = interaction.fields.getTextInputValue("big_ch")?.trim();
-        const topText = interaction.fields.getTextInputValue("top_ch")?.trim();
-        const resText = interaction.fields.getTextInputValue("res_ch")?.trim();
-
-        const panelId = parseChannelIdFromText(panelText);
-        const bigId = parseChannelIdFromText(bigText);
-        const topId = parseChannelIdFromText(topText);
-        const resId = parseChannelIdFromText(resText);
+        const panelId = parseChannelIdFromText(interaction.fields.getTextInputValue("panel_ch")?.trim() || "");
+        const bigId = parseChannelIdFromText(interaction.fields.getTextInputValue("big_ch")?.trim() || "");
+        const topId = parseChannelIdFromText(interaction.fields.getTextInputValue("top_ch")?.trim() || "");
+        const resId = parseChannelIdFromText(interaction.fields.getTextInputValue("res_ch")?.trim() || "");
 
         if (!panelId || !bigId || !topId || !resId) {
-          return interaction.reply(eph("❌ Paste real #channel mentions or channel IDs."));
+          return interaction.reply(ephContent("❌ Paste real #channel mentions or channel IDs."));
         }
 
         // Reset message IDs so we recreate them in the new channels
@@ -955,7 +998,6 @@ client.on("interactionCreate", async (interaction) => {
           bigbass_channel_id: bigId,
           top5_channel_id: topId,
           results_channel_id: resId,
-
           cur_bigbass_msg_id: null,
           cur_top5_msg_id: null,
           monthly_winners_msg_id: null,
@@ -966,54 +1008,48 @@ client.on("interactionCreate", async (interaction) => {
         await updateAutoEmbeds(interaction.guild);
 
         return interaction.reply(
-          eph(`✅ Channels set:
-• Panel: <#${panelId}>
-• Big Bass: <#${bigId}>
-• Top 5: <#${topId}>
-• Results: <#${resId}>`)
+          ephContent(
+            `✅ Channels set:\n• Panel: <#${panelId}>\n• Big Bass: <#${bigId}>\n• Top 5: <#${topId}>\n• Results: <#${resId}>`
+          )
         );
       }
 
       if (interaction.customId === "start_tournament_modal") {
-        if (!isAdmin) return interaction.reply(eph("❌ Admins only."));
+        if (!isAdmin) return interaction.reply(ephContent("❌ Admins only."));
 
-        const name = interaction.fields.getTextInputValue("name")?.trim();
-        if (!name) return interaction.reply(eph("❌ Tournament name required."));
+        const name = (interaction.fields.getTextInputValue("name") || "").trim();
+        if (!name) return interaction.reply(ephContent("❌ Tournament name required."));
 
         await startTournament(interaction.guildId, name);
-
-        // Update auto embeds immediately
         await updateAutoEmbeds(interaction.guild);
 
-        return interaction.reply(eph(`✅ Started tournament: **${name}**`));
+        return interaction.reply(ephContent(`✅ Started tournament: **${name}**`));
       }
 
       if (interaction.customId === "weighin_modal") {
-        // Enforce panel channel for weigh-ins
         if (cfg?.panel_channel_id && interaction.channelId !== cfg.panel_channel_id) {
-          return interaction.reply(eph(`❌ Submit weigh-ins in <#${cfg.panel_channel_id}>`));
+          return interaction.reply(ephContent(`❌ Submit weigh-ins in <#${cfg.panel_channel_id}>`));
         }
+        if (!active) return interaction.reply(ephContent("❌ No active tournament."));
 
-        if (!active) return interaction.reply(eph("❌ No active tournament."));
-
-        const weightRaw = interaction.fields.getTextInputValue("weight")?.trim();
-        const notes = interaction.fields.getTextInputValue("notes")?.trim() || null;
+        const weightRaw = (interaction.fields.getTextInputValue("weight") || "").trim();
+        const notes = (interaction.fields.getTextInputValue("notes") || "").trim() || null;
 
         const weight = Number(weightRaw);
         if (!Number.isFinite(weight) || weight <= 0) {
-          return interaction.reply(eph("❌ Weight must be a valid number (example: 5.62)."));
+          return interaction.reply(ephContent("❌ Weight must be a valid number (example: 5.62)."));
         }
 
         const latest = await getLatestUpload({
           guildId: interaction.guildId,
           channelId: interaction.channelId,
           userId: interaction.user.id,
-          maxMinutes: 180,
+          maxMinutes: PHOTO_LOOKBACK_MINUTES,
         });
 
         if (!latest) {
           return interaction.reply(
-            eph("❌ I don’t see a recent photo from you here.\nUpload your photo first, then try again.")
+            ephContent("❌ I don’t see a recent photo from you here.\nUpload your photo first, then try again.")
           );
         }
 
@@ -1027,7 +1063,6 @@ client.on("interactionCreate", async (interaction) => {
           notes,
         });
 
-        // Update auto embeds
         await updateAutoEmbeds(interaction.guild);
 
         const receipt = new EmbedBuilder()
@@ -1046,17 +1081,16 @@ client.on("interactionCreate", async (interaction) => {
     }
   } catch (err) {
     console.error(err);
+
     if (interaction.isRepliable()) {
+      const payload = ephContent("❌ Something went wrong. Check logs.");
       if (interaction.deferred || interaction.replied) {
-        return interaction.followUp(eph("❌ Something went wrong. Check logs.")).catch(() => {});
+        return interaction.followUp(payload).catch(() => {});
       }
-      return interaction.reply(eph("❌ Something went wrong. Check logs.")).catch(() => {});
+      return interaction.reply(payload).catch(() => {});
     }
   }
 });
 
 // -------------------- START BOT --------------------
 client.login(process.env.DISCORD_TOKEN);
-
-
-
