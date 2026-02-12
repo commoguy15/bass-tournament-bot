@@ -497,7 +497,7 @@ function getMonthLeaderboard(guildId, yyyyMm) {
 }
 
 // -------------------- DISCORD EVENTS --------------------
-client.once("ready", async () => {
+client.once("clientReady", async () => {
   console.log(`Logged in as ${client.user.tag}`);
   try {
     await registerCommands();
@@ -770,4 +770,5 @@ client.on("interactionCreate", async (interaction) => {
 
 // -------------------- START BOT --------------------
 client.login(process.env.DISCORD_TOKEN);
+
 
