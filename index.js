@@ -1,27 +1,31 @@
 /**
- * Bass Tournament Discord Bot — Auto-Updating Leaderboard Embeds (UI Panel)
+ * Bass Tournament Discord Bot — UI Panel + Auto-Updating Embeds (Separate Channels)
  *
- * ✅ Only slash command: /panel (admin only)
- * ✅ Panel has:
- *   - Submit Weigh-in (modal)
- *   - Start Tournament (modal, admin)
- *   - End Tournament (admin)
- *   - Set Channels (modal, admin) -> panel/leaderboard/results
- *
+ * What this version does (per your request):
+ * ✅ Only ONE slash command: /panel (admin only)
+ * ✅ Panel UI (buttons) — NO slash commands for users
  * ✅ Weigh-in flow:
- *   1) User uploads photo FIRST in the panel channel
- *   2) User clicks "Submit Weigh-in"
- *   3) Modal asks weight + notes
- *   4) Bot uses user's MOST RECENT image upload in that channel (within last 180 min)
+ *    1) User uploads photo FIRST in the PANEL channel
+ *    2) User clicks "Submit Weigh-in" button
+ *    3) Modal asks for weight + notes
+ *    4) Bot uses that user's latest uploaded image in the panel channel (last 180 minutes)
+ *
+ * ✅ Separate channels:
+ *    - PANEL channel (UI + weigh-in uploads)
+ *    - BIG BASS channel (auto-updating embed)
+ *    - TOP 5 / TOTAL BAG channel (auto-updating embed)
+ *    - RESULTS channel (final standings + monthly winners + yearly winners embeds)
  *
  * ✅ No approve/reject
- * ✅ Leaderboard channel has 4 persistent messages that UPDATE automatically:
- *   - Big Bass (Current Tournament)
- *   - Total Bag Top 5 (Current Tournament)
- *   - Monthly Winners (current month): #1 bag + #1 big bass
- *   - Yearly Winners (current year): #1 bag + #1 big bass
- *
- * ✅ Results channel gets FINAL standings on End Tournament
+ * ✅ Auto-updating embeds (no “request” needed):
+ *    - Big Bass (Current Tournament) in Big Bass channel
+ *    - Total Bag (Top 5) (Current Tournament) in Top 5 channel
+ *    - Monthly Winners (current month) in Results channel
+ *    - Yearly Winners (current year) in Results channel
+ * ✅ On End Tournament:
+ *    - Snapshots results
+ *    - Posts FINAL results embeds to Results channel
+ *    - Updates Monthly/Yearly winners embeds
  *
  * IMPORTANT DISCORD SETTING:
  * Discord Developer Portal -> Bot -> Privileged Gateway Intents:
@@ -32,7 +36,7 @@
  * CLIENT_ID=... (Application ID)
  * GUILD_ID=...  (Server ID)
  * Optional:
- * DB_PATH=/data/tournament.sqlite (defaults to /data/tournament.sqlite)
+ * DB_PATH=/data/tournament.sqlite  (defaults to /data/tournament.sqlite)
  */
 
 require("dotenv").config();
@@ -54,6 +58,7 @@ const {
   TextInputBuilder,
   TextInputStyle,
 } = require("discord.js");
+const { InteractionResponseFlags } = require("discord-api-types/v10");
 
 // -------------------- ENV CHECK --------------------
 const REQUIRED_ENVS = ["DISCORD_TOKEN", "CLIENT_ID", "GUILD_ID"];
@@ -76,12 +81,14 @@ db.serialize(() => {
   db.run(`
     CREATE TABLE IF NOT EXISTS config (
       guild_id TEXT PRIMARY KEY,
+
       panel_channel_id TEXT,
-      leaderboard_channel_id TEXT,
+      bigbass_channel_id TEXT,
+      top5_channel_id TEXT,
       results_channel_id TEXT,
 
       cur_bigbass_msg_id TEXT,
-      cur_totalbag_msg_id TEXT,
+      cur_top5_msg_id TEXT,
       monthly_winners_msg_id TEXT,
       yearly_winners_msg_id TEXT
     )
@@ -139,12 +146,13 @@ db.serialize(() => {
     )
   `);
 
-  // migrations
+  // migrations for older DBs
   safeAlter(`ALTER TABLE config ADD COLUMN panel_channel_id TEXT`);
-  safeAlter(`ALTER TABLE config ADD COLUMN leaderboard_channel_id TEXT`);
+  safeAlter(`ALTER TABLE config ADD COLUMN bigbass_channel_id TEXT`);
+  safeAlter(`ALTER TABLE config ADD COLUMN top5_channel_id TEXT`);
   safeAlter(`ALTER TABLE config ADD COLUMN results_channel_id TEXT`);
   safeAlter(`ALTER TABLE config ADD COLUMN cur_bigbass_msg_id TEXT`);
-  safeAlter(`ALTER TABLE config ADD COLUMN cur_totalbag_msg_id TEXT`);
+  safeAlter(`ALTER TABLE config ADD COLUMN cur_top5_msg_id TEXT`);
   safeAlter(`ALTER TABLE config ADD COLUMN monthly_winners_msg_id TEXT`);
   safeAlter(`ALTER TABLE config ADD COLUMN yearly_winners_msg_id TEXT`);
 
@@ -178,6 +186,14 @@ async function registerCommands() {
   console.log("Slash commands registered for the guild.");
 }
 
+// -------------------- UTIL: EPHEMERAL REPLIES --------------------
+function eph(content) {
+  return { content, flags: InteractionResponseFlags.Ephemeral };
+}
+function ephEmbeds(embeds) {
+  return { embeds, flags: InteractionResponseFlags.Ephemeral };
+}
+
 // -------------------- DB HELPERS --------------------
 function getConfig(guildId) {
   return new Promise((resolve, reject) => {
@@ -189,13 +205,14 @@ function getConfig(guildId) {
 }
 
 function upsertConfig(guildId, patch) {
-  const fields = {
+  const f = {
     panel_channel_id: patch.panel_channel_id ?? null,
-    leaderboard_channel_id: patch.leaderboard_channel_id ?? null,
+    bigbass_channel_id: patch.bigbass_channel_id ?? null,
+    top5_channel_id: patch.top5_channel_id ?? null,
     results_channel_id: patch.results_channel_id ?? null,
 
     cur_bigbass_msg_id: patch.cur_bigbass_msg_id ?? null,
-    cur_totalbag_msg_id: patch.cur_totalbag_msg_id ?? null,
+    cur_top5_msg_id: patch.cur_top5_msg_id ?? null,
     monthly_winners_msg_id: patch.monthly_winners_msg_id ?? null,
     yearly_winners_msg_id: patch.yearly_winners_msg_id ?? null,
   };
@@ -206,32 +223,35 @@ function upsertConfig(guildId, patch) {
       INSERT INTO config (
         guild_id,
         panel_channel_id,
-        leaderboard_channel_id,
+        bigbass_channel_id,
+        top5_channel_id,
         results_channel_id,
         cur_bigbass_msg_id,
-        cur_totalbag_msg_id,
+        cur_top5_msg_id,
         monthly_winners_msg_id,
         yearly_winners_msg_id
       )
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(guild_id) DO UPDATE SET
         panel_channel_id=COALESCE(excluded.panel_channel_id, config.panel_channel_id),
-        leaderboard_channel_id=COALESCE(excluded.leaderboard_channel_id, config.leaderboard_channel_id),
+        bigbass_channel_id=COALESCE(excluded.bigbass_channel_id, config.bigbass_channel_id),
+        top5_channel_id=COALESCE(excluded.top5_channel_id, config.top5_channel_id),
         results_channel_id=COALESCE(excluded.results_channel_id, config.results_channel_id),
         cur_bigbass_msg_id=COALESCE(excluded.cur_bigbass_msg_id, config.cur_bigbass_msg_id),
-        cur_totalbag_msg_id=COALESCE(excluded.cur_totalbag_msg_id, config.cur_totalbag_msg_id),
+        cur_top5_msg_id=COALESCE(excluded.cur_top5_msg_id, config.cur_top5_msg_id),
         monthly_winners_msg_id=COALESCE(excluded.monthly_winners_msg_id, config.monthly_winners_msg_id),
         yearly_winners_msg_id=COALESCE(excluded.yearly_winners_msg_id, config.yearly_winners_msg_id)
       `,
       [
         guildId,
-        fields.panel_channel_id,
-        fields.leaderboard_channel_id,
-        fields.results_channel_id,
-        fields.cur_bigbass_msg_id,
-        fields.cur_totalbag_msg_id,
-        fields.monthly_winners_msg_id,
-        fields.yearly_winners_msg_id,
+        f.panel_channel_id,
+        f.bigbass_channel_id,
+        f.top5_channel_id,
+        f.results_channel_id,
+        f.cur_bigbass_msg_id,
+        f.cur_top5_msg_id,
+        f.monthly_winners_msg_id,
+        f.yearly_winners_msg_id,
       ],
       (err) => (err ? reject(err) : resolve())
     );
@@ -281,7 +301,8 @@ function endTournament(guildId, tournamentId) {
 function insertUpload({ guildId, channelId, userId, messageId, imageUrl }) {
   return new Promise((resolve, reject) => {
     db.run(
-      `INSERT INTO uploads (guild_id, channel_id, user_id, message_id, image_url) VALUES (?, ?, ?, ?, ?)`,
+      `INSERT INTO uploads (guild_id, channel_id, user_id, message_id, image_url)
+       VALUES (?, ?, ?, ?, ?)`,
       [guildId, channelId, userId, messageId, imageUrl],
       (err) => (err ? reject(err) : resolve())
     );
@@ -405,7 +426,6 @@ async function snapshotTournamentResults(guildId, tournamentId) {
 }
 
 function getMonthSummaryWinners(guildId, yyyyMm) {
-  // winners computed from finalized tournaments (tournament_results)
   return new Promise((resolve, reject) => {
     db.get(
       `
@@ -466,7 +486,8 @@ function panelEmbed(activeTournament, cfg) {
   const status = activeTournament ? `🟢 **ACTIVE:** ${activeTournament.name}` : "🔴 **No active tournament**";
 
   const panelCh = cfg?.panel_channel_id ? `<#${cfg.panel_channel_id}>` : "Not set";
-  const lbCh = cfg?.leaderboard_channel_id ? `<#${cfg.leaderboard_channel_id}>` : "Not set";
+  const bigCh = cfg?.bigbass_channel_id ? `<#${cfg.bigbass_channel_id}>` : "Not set";
+  const topCh = cfg?.top5_channel_id ? `<#${cfg.top5_channel_id}>` : "Not set";
   const resCh = cfg?.results_channel_id ? `<#${cfg.results_channel_id}>` : "Not set";
 
   return new EmbedBuilder()
@@ -476,13 +497,14 @@ function panelEmbed(activeTournament, cfg) {
         status,
         "",
         "✅ **Weigh-in steps**",
-        "1) Upload your weigh-in photo in the **Panel Channel**",
+        "1) Upload your photo in the PANEL channel",
         "2) Click **Submit Weigh-in**",
         "3) Enter weight + notes",
         "",
-        "⚙️ **Channel Routing**",
+        "📌 **Channels**",
         `• Panel: ${panelCh}`,
-        `• Leaderboards: ${lbCh}`,
+        `• Big Bass: ${bigCh}`,
+        `• Top 5: ${topCh}`,
         `• Results: ${resCh}`,
       ].join("\n")
     )
@@ -493,23 +515,21 @@ function panelComponents(isAdmin) {
   return [
     new ActionRowBuilder().addComponents(
       new ButtonBuilder().setCustomId("submit_weighin").setLabel("Submit Weigh-in").setStyle(ButtonStyle.Success),
-      const panelInput = new TextInputBuilder()
-  .setCustomId("panel_ch")
-  .setLabel("Panel channel (#channel or ID)")
-  .setStyle(TextInputStyle.Short)
-  .setRequired(true);
-
-const lbInput = new TextInputBuilder()
-  .setCustomId("lb_ch")
-  .setLabel("Leaderboard channel (#channel or ID)")
-  .setStyle(TextInputStyle.Short)
-  .setRequired(true);
-
-const resInput = new TextInputBuilder()
-  .setCustomId("res_ch")
-  .setLabel("Results channel (#channel or ID)")
-  .setStyle(TextInputStyle.Short)
-  .setRequired(true);
+      new ButtonBuilder()
+        .setCustomId("start_tournament")
+        .setLabel("Start Tourney")
+        .setStyle(ButtonStyle.Primary)
+        .setDisabled(!isAdmin),
+      new ButtonBuilder()
+        .setCustomId("end_tournament")
+        .setLabel("End Tourney")
+        .setStyle(ButtonStyle.Danger)
+        .setDisabled(!isAdmin),
+      new ButtonBuilder()
+        .setCustomId("set_channels")
+        .setLabel("Set Channels")
+        .setStyle(ButtonStyle.Secondary)
+        .setDisabled(!isAdmin)
     ),
   ];
 }
@@ -525,7 +545,7 @@ function bigBassCurrentEmbed(tournamentName, rows) {
     .setTimestamp(new Date());
 }
 
-function totalBagCurrentEmbed(tournamentName, rows) {
+function top5Embed(tournamentName, rows) {
   return new EmbedBuilder()
     .setTitle(`🎣 Total Bag (Top 5) — ${tournamentName || "No Active Tournament"}`)
     .setDescription(
@@ -553,7 +573,7 @@ function monthlyWinnersEmbed(yyyyMm, winners) {
 
   return new EmbedBuilder()
     .setTitle(`📆 Monthly Winners — ${yyyyMm}`)
-    .setDescription([bagLine, bigLine, "", "_Monthly winners update when tournaments end._"].join("\n"))
+    .setDescription([bagLine, bigLine, "", "_Updates when tournaments end._"].join("\n"))
     .setTimestamp(new Date());
 }
 
@@ -569,7 +589,7 @@ function yearlyWinnersEmbed(yyyy, winners) {
 
   return new EmbedBuilder()
     .setTitle(`📅 Yearly Winners — ${yyyy}`)
-    .setDescription([bagLine, bigLine, "", "_Yearly winners update when tournaments end._"].join("\n"))
+    .setDescription([bagLine, bigLine, "", "_Updates when tournaments end._"].join("\n"))
     .setTimestamp(new Date());
 }
 
@@ -611,70 +631,78 @@ async function postFinalStandings(guild, resultsChannelId, tournament) {
   }
 }
 
-// -------------------- AUTO-UPDATING LEADERBOARD MESSAGES --------------------
-async function ensureLeaderboardMessages(guild, leaderboardChannelId) {
+// -------------------- MESSAGE ENSURE/UPDATE (AUTO-UPDATING EMBEDS) --------------------
+async function ensureMessage(guild, channelId, existingMessageId, createEmbed) {
+  const channel = await guild.channels.fetch(channelId).catch(() => null);
+  if (!channel) return { messageId: null };
+
+  if (existingMessageId) {
+    try {
+      const msg = await channel.messages.fetch(existingMessageId);
+      return { messageId: msg.id };
+    } catch {
+      // fall through to create
+    }
+  }
+
+  const created = await channel.send({ embeds: [createEmbed()] });
+  return { messageId: created.id };
+}
+
+async function ensureAllAutoEmbeds(guild) {
   const cfg = await getConfig(guild.id);
-  const channel = await guild.channels.fetch(leaderboardChannelId);
-  if (!channel) return null;
-
-  let curBig = null;
-  let curBag = null;
-  let mon = null;
-  let yr = null;
-
-  // fetch existing
-  if (cfg?.cur_bigbass_msg_id) {
-    try { curBig = await channel.messages.fetch(cfg.cur_bigbass_msg_id); } catch {}
-  }
-  if (cfg?.cur_totalbag_msg_id) {
-    try { curBag = await channel.messages.fetch(cfg.cur_totalbag_msg_id); } catch {}
-  }
-  if (cfg?.monthly_winners_msg_id) {
-    try { mon = await channel.messages.fetch(cfg.monthly_winners_msg_id); } catch {}
-  }
-  if (cfg?.yearly_winners_msg_id) {
-    try { yr = await channel.messages.fetch(cfg.yearly_winners_msg_id); } catch {}
-  }
-
-  // create missing (empty placeholders)
-  if (!curBig) curBig = await channel.send({ embeds: [bigBassCurrentEmbed("No Active Tournament", [])] });
-  if (!curBag) curBag = await channel.send({ embeds: [totalBagCurrentEmbed("No Active Tournament", [])] });
+  if (!cfg?.bigbass_channel_id || !cfg?.top5_channel_id || !cfg?.results_channel_id) return;
 
   const now = new Date();
   const yyyyMm = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}`;
   const yyyy = now.getFullYear();
 
-  if (!mon) mon = await channel.send({ embeds: [monthlyWinnersEmbed(yyyyMm, null)] });
-  if (!yr) yr = await channel.send({ embeds: [yearlyWinnersEmbed(yyyy, null)] });
+  const big = await ensureMessage(
+    guild,
+    cfg.bigbass_channel_id,
+    cfg.cur_bigbass_msg_id,
+    () => bigBassCurrentEmbed("No Active Tournament", [])
+  );
+
+  const top5 = await ensureMessage(
+    guild,
+    cfg.top5_channel_id,
+    cfg.cur_top5_msg_id,
+    () => top5Embed("No Active Tournament", [])
+  );
+
+  const mon = await ensureMessage(
+    guild,
+    cfg.results_channel_id,
+    cfg.monthly_winners_msg_id,
+    () => monthlyWinnersEmbed(yyyyMm, null)
+  );
+
+  const yr = await ensureMessage(
+    guild,
+    cfg.results_channel_id,
+    cfg.yearly_winners_msg_id,
+    () => yearlyWinnersEmbed(yyyy, null)
+  );
 
   await upsertConfig(guild.id, {
-    leaderboard_channel_id: leaderboardChannelId,
-    cur_bigbass_msg_id: curBig.id,
-    cur_totalbag_msg_id: curBag.id,
-    monthly_winners_msg_id: mon.id,
-    yearly_winners_msg_id: yr.id,
+    cur_bigbass_msg_id: big.messageId,
+    cur_top5_msg_id: top5.messageId,
+    monthly_winners_msg_id: mon.messageId,
+    yearly_winners_msg_id: yr.messageId,
   });
-
-  return { curBig, curBag, mon, yr };
 }
 
-async function updateAllLeaderboardEmbeds(guild) {
+async function updateAutoEmbeds(guild) {
   const cfg = await getConfig(guild.id);
-  if (!cfg?.leaderboard_channel_id) return;
+  if (!cfg?.bigbass_channel_id || !cfg?.top5_channel_id || !cfg?.results_channel_id) return;
 
-  const channel = await guild.channels.fetch(cfg.leaderboard_channel_id);
-  if (!channel) return;
-
-  // ensure messages exist
-  await ensureLeaderboardMessages(guild, cfg.leaderboard_channel_id);
+  await ensureAllAutoEmbeds(guild);
 
   const active = await getActiveTournament(guild.id);
-
-  // current tournament boards
   const bigRows = active ? await getBigBassLeaderboard(guild.id, active.id) : [];
   const bagRows = active ? await getTotalBagLeaderboard(guild.id, active.id) : [];
 
-  // monthly/yearly winners
   const now = new Date();
   const yyyyMm = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}`;
   const yyyy = now.getFullYear();
@@ -682,24 +710,31 @@ async function updateAllLeaderboardEmbeds(guild) {
   const monthW = await getMonthSummaryWinners(guild.id, yyyyMm).catch(() => null);
   const yearW = await getYearSummaryWinners(guild.id, yyyy).catch(() => null);
 
-  // edit the stored messages
+  // Update Big Bass message
   try {
-    const msg = await channel.messages.fetch(cfg.cur_bigbass_msg_id);
+    const ch = await guild.channels.fetch(cfg.bigbass_channel_id);
+    const msg = await ch.messages.fetch(cfg.cur_bigbass_msg_id);
     await msg.edit({ embeds: [bigBassCurrentEmbed(active?.name || "No Active Tournament", bigRows)] });
   } catch {}
 
+  // Update Top 5 message
   try {
-    const msg = await channel.messages.fetch(cfg.cur_totalbag_msg_id);
-    await msg.edit({ embeds: [totalBagCurrentEmbed(active?.name || "No Active Tournament", bagRows)] });
+    const ch = await guild.channels.fetch(cfg.top5_channel_id);
+    const msg = await ch.messages.fetch(cfg.cur_top5_msg_id);
+    await msg.edit({ embeds: [top5Embed(active?.name || "No Active Tournament", bagRows)] });
   } catch {}
 
+  // Update Monthly Winners message
   try {
-    const msg = await channel.messages.fetch(cfg.monthly_winners_msg_id);
+    const ch = await guild.channels.fetch(cfg.results_channel_id);
+    const msg = await ch.messages.fetch(cfg.monthly_winners_msg_id);
     await msg.edit({ embeds: [monthlyWinnersEmbed(yyyyMm, monthW)] });
   } catch {}
 
+  // Update Yearly Winners message
   try {
-    const msg = await channel.messages.fetch(cfg.yearly_winners_msg_id);
+    const ch = await guild.channels.fetch(cfg.results_channel_id);
+    const msg = await ch.messages.fetch(cfg.yearly_winners_msg_id);
     await msg.edit({ embeds: [yearlyWinnersEmbed(yyyy, yearW)] });
   } catch {}
 }
@@ -710,6 +745,7 @@ client.on("messageCreate", async (message) => {
     if (!message.guild) return;
     if (message.author?.bot) return;
 
+    // Only store first image attachment
     const img = message.attachments.find((a) => (a.contentType || "").startsWith("image/"));
     if (!img) return;
 
@@ -735,7 +771,7 @@ client.once("clientReady", async () => {
   }
 });
 
-// -------------------- INTERACTIONS --------------------
+// -------------------- HELPERS --------------------
 function parseChannelIdFromText(text) {
   // accepts <#123> or 123
   const mention = text.match(/<#(\d{15,25})>/);
@@ -745,6 +781,7 @@ function parseChannelIdFromText(text) {
   return null;
 }
 
+// -------------------- INTERACTIONS --------------------
 client.on("interactionCreate", async (interaction) => {
   try {
     const isAdmin =
@@ -754,31 +791,32 @@ client.on("interactionCreate", async (interaction) => {
     // /panel
     if (interaction.isChatInputCommand()) {
       if (interaction.commandName !== "panel") return;
-      if (!isAdmin) return interaction.reply({ content: "❌ Admins only.", ephemeral: true });
+      if (!isAdmin) return interaction.reply(eph("❌ Admins only."));
 
-      // Default routing: panel channel = where /panel ran
-      // If leaderboards/results not set yet, default them to same channel for now.
-      const cfg = await getConfig(interaction.guildId);
+      const existing = await getConfig(interaction.guildId);
+
+      // Default all channels to where /panel ran if not set yet
       await upsertConfig(interaction.guildId, {
         panel_channel_id: interaction.channelId,
-        leaderboard_channel_id: cfg?.leaderboard_channel_id || interaction.channelId,
-        results_channel_id: cfg?.results_channel_id || interaction.channelId,
+        bigbass_channel_id: existing?.bigbass_channel_id || interaction.channelId,
+        top5_channel_id: existing?.top5_channel_id || interaction.channelId,
+        results_channel_id: existing?.results_channel_id || interaction.channelId,
       });
 
-      const updatedCfg = await getConfig(interaction.guildId);
+      const cfg = await getConfig(interaction.guildId);
       const active = await getActiveTournament(interaction.guildId);
 
-      // Ensure the leaderboard messages exist + update them
-      await ensureLeaderboardMessages(interaction.guild, updatedCfg.leaderboard_channel_id);
-      await updateAllLeaderboardEmbeds(interaction.guild);
+      // Ensure + update auto embeds
+      await ensureAllAutoEmbeds(interaction.guild);
+      await updateAutoEmbeds(interaction.guild);
 
-      // Post the panel
+      // Post panel
       await interaction.channel.send({
-        embeds: [panelEmbed(active, updatedCfg)],
+        embeds: [panelEmbed(active, cfg)],
         components: panelComponents(true),
       });
 
-      return interaction.reply({ content: "✅ Panel posted.", ephemeral: true });
+      return interaction.reply(eph("✅ Panel posted."));
     }
 
     // Buttons
@@ -787,54 +825,60 @@ client.on("interactionCreate", async (interaction) => {
       const active = await getActiveTournament(interaction.guildId);
 
       if (interaction.customId === "set_channels") {
-  if (!isAdmin) return interaction.reply({ content: "❌ Admins only.", ephemeral: true });
+        if (!isAdmin) return interaction.reply(eph("❌ Admins only."));
 
-  const modal = new ModalBuilder().setCustomId("set_channels_modal").setTitle("Set Channels");
+        const modal = new ModalBuilder().setCustomId("set_channels_modal").setTitle("Set Channels");
 
-  const panelInput = new TextInputBuilder()
-    .setCustomId("panel_ch")
-    .setLabel("Panel channel (#channel or ID)")
-    .setStyle(TextInputStyle.Short)
-    .setRequired(true);
+        // Labels MUST be <= 45 chars
+        const panelInput = new TextInputBuilder()
+          .setCustomId("panel_ch")
+          .setLabel("Panel channel (#channel or ID)")
+          .setStyle(TextInputStyle.Short)
+          .setRequired(true);
 
-  const lbInput = new TextInputBuilder()
-    .setCustomId("lb_ch")
-    .setLabel("Leaderboard channel (#channel or ID)")
-    .setStyle(TextInputStyle.Short)
-    .setRequired(true);
+        const bigInput = new TextInputBuilder()
+          .setCustomId("big_ch")
+          .setLabel("Big Bass channel (#channel or ID)")
+          .setStyle(TextInputStyle.Short)
+          .setRequired(true);
 
-  const resInput = new TextInputBuilder()
-    .setCustomId("res_ch")
-    .setLabel("Results channel (#channel or ID)")
-    .setStyle(TextInputStyle.Short)
-    .setRequired(true);
+        const topInput = new TextInputBuilder()
+          .setCustomId("top_ch")
+          .setLabel("Top 5 channel (#channel or ID)")
+          .setStyle(TextInputStyle.Short)
+          .setRequired(true);
 
-  modal.addComponents(
-    new ActionRowBuilder().addComponents(panelInput),
-    new ActionRowBuilder().addComponents(lbInput),
-    new ActionRowBuilder().addComponents(resInput)
-  );
+        const resInput = new TextInputBuilder()
+          .setCustomId("res_ch")
+          .setLabel("Results channel (#channel or ID)")
+          .setStyle(TextInputStyle.Short)
+          .setRequired(true);
 
-  return interaction.showModal(modal);
-}
+        modal.addComponents(
+          new ActionRowBuilder().addComponents(panelInput),
+          new ActionRowBuilder().addComponents(bigInput),
+          new ActionRowBuilder().addComponents(topInput),
+          new ActionRowBuilder().addComponents(resInput)
+        );
+
+        return interaction.showModal(modal);
+      }
+
       if (interaction.customId === "submit_weighin") {
-        // Must be in panel channel (recommended)
+        // Only allow weigh-ins in panel channel
         if (cfg?.panel_channel_id && interaction.channelId !== cfg.panel_channel_id) {
-          return interaction.reply({
-            content: `❌ Submit weigh-ins in the panel channel: <#${cfg.panel_channel_id}>`,
-            ephemeral: true,
-          });
+          return interaction.reply(eph(`❌ Submit weigh-ins in <#${cfg.panel_channel_id}>`));
         }
 
         if (!active) {
-          return interaction.reply({ content: "❌ No active tournament. Admin must start one first.", ephemeral: true });
+          return interaction.reply(eph("❌ No active tournament. Admin must start one first."));
         }
 
         const modal = new ModalBuilder().setCustomId("weighin_modal").setTitle("Submit Weigh-in");
 
         const weightInput = new TextInputBuilder()
           .setCustomId("weight")
-          .setLabel("Weight in pounds (example: 5.62)")
+          .setLabel("Weight (lbs) e.g., 5.62")
           .setStyle(TextInputStyle.Short)
           .setRequired(true);
 
@@ -853,9 +897,10 @@ client.on("interactionCreate", async (interaction) => {
       }
 
       if (interaction.customId === "start_tournament") {
-        if (!isAdmin) return interaction.reply({ content: "❌ Admins only.", ephemeral: true });
+        if (!isAdmin) return interaction.reply(eph("❌ Admins only."));
 
         const modal = new ModalBuilder().setCustomId("start_tournament_modal").setTitle("Start Tournament");
+
         const nameInput = new TextInputBuilder()
           .setCustomId("name")
           .setLabel("Tournament name")
@@ -867,8 +912,8 @@ client.on("interactionCreate", async (interaction) => {
       }
 
       if (interaction.customId === "end_tournament") {
-        if (!isAdmin) return interaction.reply({ content: "❌ Admins only.", ephemeral: true });
-        if (!active) return interaction.reply({ content: "❌ No active tournament to end.", ephemeral: true });
+        if (!isAdmin) return interaction.reply(eph("❌ Admins only."));
+        if (!active) return interaction.reply(eph("❌ No active tournament to end."));
 
         const resultsChannelId = cfg?.results_channel_id || interaction.channelId;
 
@@ -876,87 +921,88 @@ client.on("interactionCreate", async (interaction) => {
         await snapshotTournamentResults(interaction.guildId, active.id);
         await postFinalStandings(interaction.guild, resultsChannelId, active);
 
-        // Update leaderboards + winners (monthly/yearly) after ending
-        await updateAllLeaderboardEmbeds(interaction.guild);
+        // Update auto embeds after ending (monthly/yearly winners)
+        await updateAutoEmbeds(interaction.guild);
 
-        return interaction.reply({ content: `🛑 Ended **${active.name}**. Finals posted.`, ephemeral: true });
+        return interaction.reply(eph(`🛑 Ended **${active.name}**. Finals posted.`));
       }
     }
 
     // Modals
     if (interaction.isModalSubmit()) {
+      const cfg = await getConfig(interaction.guildId);
+      const active = await getActiveTournament(interaction.guildId);
+
       if (interaction.customId === "set_channels_modal") {
-        if (!isAdmin) return interaction.reply({ content: "❌ Admins only.", ephemeral: true });
+        if (!isAdmin) return interaction.reply(eph("❌ Admins only."));
 
         const panelText = interaction.fields.getTextInputValue("panel_ch")?.trim();
-        const lbText = interaction.fields.getTextInputValue("lb_ch")?.trim();
+        const bigText = interaction.fields.getTextInputValue("big_ch")?.trim();
+        const topText = interaction.fields.getTextInputValue("top_ch")?.trim();
         const resText = interaction.fields.getTextInputValue("res_ch")?.trim();
 
         const panelId = parseChannelIdFromText(panelText);
-        const lbId = parseChannelIdFromText(lbText);
+        const bigId = parseChannelIdFromText(bigText);
+        const topId = parseChannelIdFromText(topText);
         const resId = parseChannelIdFromText(resText);
 
-        if (!panelId || !lbId || !resId) {
-          return interaction.reply({
-            content: "❌ Couldn’t read one of the channels. Paste a real #channel mention or channel ID.",
-            ephemeral: true,
-          });
+        if (!panelId || !bigId || !topId || !resId) {
+          return interaction.reply(eph("❌ Paste real #channel mentions or channel IDs."));
         }
 
+        // Reset message IDs so we recreate them in the new channels
         await upsertConfig(interaction.guildId, {
           panel_channel_id: panelId,
-          leaderboard_channel_id: lbId,
+          bigbass_channel_id: bigId,
+          top5_channel_id: topId,
           results_channel_id: resId,
-          // Reset message IDs so we recreate them in the new leaderboard channel
+
           cur_bigbass_msg_id: null,
-          cur_totalbag_msg_id: null,
+          cur_top5_msg_id: null,
           monthly_winners_msg_id: null,
           yearly_winners_msg_id: null,
         });
 
-        // Ensure new leaderboard messages exist and update
-        await ensureLeaderboardMessages(interaction.guild, lbId);
-        await updateAllLeaderboardEmbeds(interaction.guild);
+        await ensureAllAutoEmbeds(interaction.guild);
+        await updateAutoEmbeds(interaction.guild);
 
-        return interaction.reply({
-          content: `✅ Channels set.\nPanel: <#${panelId}>\nLeaderboards: <#${lbId}>\nResults: <#${resId}>`,
-          ephemeral: true,
-        });
+        return interaction.reply(
+          eph(`✅ Channels set:
+• Panel: <#${panelId}>
+• Big Bass: <#${bigId}>
+• Top 5: <#${topId}>
+• Results: <#${resId}>`)
+        );
       }
 
       if (interaction.customId === "start_tournament_modal") {
-        if (!isAdmin) return interaction.reply({ content: "❌ Admins only.", ephemeral: true });
+        if (!isAdmin) return interaction.reply(eph("❌ Admins only."));
 
         const name = interaction.fields.getTextInputValue("name")?.trim();
-        if (!name) return interaction.reply({ content: "❌ Tournament name required.", ephemeral: true });
+        if (!name) return interaction.reply(eph("❌ Tournament name required."));
 
         await startTournament(interaction.guildId, name);
 
-        // Update leaderboards immediately
-        await updateAllLeaderboardEmbeds(interaction.guild);
+        // Update auto embeds immediately
+        await updateAutoEmbeds(interaction.guild);
 
-        return interaction.reply({ content: `✅ Started tournament: **${name}**`, ephemeral: true });
+        return interaction.reply(eph(`✅ Started tournament: **${name}**`));
       }
 
       if (interaction.customId === "weighin_modal") {
-        const cfg = await getConfig(interaction.guildId);
-        const active = await getActiveTournament(interaction.guildId);
-
+        // Enforce panel channel for weigh-ins
         if (cfg?.panel_channel_id && interaction.channelId !== cfg.panel_channel_id) {
-          return interaction.reply({
-            content: `❌ Submit weigh-ins in the panel channel: <#${cfg.panel_channel_id}>`,
-            ephemeral: true,
-          });
+          return interaction.reply(eph(`❌ Submit weigh-ins in <#${cfg.panel_channel_id}>`));
         }
 
-        if (!active) return interaction.reply({ content: "❌ No active tournament.", ephemeral: true });
+        if (!active) return interaction.reply(eph("❌ No active tournament."));
 
         const weightRaw = interaction.fields.getTextInputValue("weight")?.trim();
         const notes = interaction.fields.getTextInputValue("notes")?.trim() || null;
 
         const weight = Number(weightRaw);
         if (!Number.isFinite(weight) || weight <= 0) {
-          return interaction.reply({ content: "❌ Weight must be a valid number (example: 5.62).", ephemeral: true });
+          return interaction.reply(eph("❌ Weight must be a valid number (example: 5.62)."));
         }
 
         const latest = await getLatestUpload({
@@ -967,11 +1013,9 @@ client.on("interactionCreate", async (interaction) => {
         });
 
         if (!latest) {
-          return interaction.reply({
-            content:
-              "❌ I don’t see a recent weigh-in photo from you in this channel.\nUpload your photo first, then click **Submit Weigh-in** again.",
-            ephemeral: true,
-          });
+          return interaction.reply(
+            eph("❌ I don’t see a recent photo from you here.\nUpload your photo first, then try again.")
+          );
         }
 
         await insertWeighIn({
@@ -984,8 +1028,8 @@ client.on("interactionCreate", async (interaction) => {
           notes,
         });
 
-        // Update current boards
-        await updateAllLeaderboardEmbeds(interaction.guild);
+        // Update auto embeds
+        await updateAutoEmbeds(interaction.guild);
 
         const receipt = new EmbedBuilder()
           .setTitle("✅ Weigh-in Submitted")
@@ -998,20 +1042,21 @@ client.on("interactionCreate", async (interaction) => {
           .setImage(latest.image_url)
           .setTimestamp(new Date());
 
-        return interaction.reply({ embeds: [receipt], ephemeral: true });
+        return interaction.reply(ephEmbeds([receipt]));
       }
     }
   } catch (err) {
     console.error(err);
     if (interaction.isRepliable()) {
       if (interaction.deferred || interaction.replied) {
-        return interaction.followUp({ content: "❌ Something went wrong. Check logs.", ephemeral: true }).catch(() => {});
+        return interaction.followUp(eph("❌ Something went wrong. Check logs.")).catch(() => {});
       }
-      await interaction.reply({ content: "❌ Something went wrong. Check logs.", ephemeral: true }).catch(() => {});
+      return interaction.reply(eph("❌ Something went wrong. Check logs.")).catch(() => {});
     }
   }
 });
 
 // -------------------- START BOT --------------------
 client.login(process.env.DISCORD_TOKEN);
+
 
