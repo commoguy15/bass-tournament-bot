@@ -48,7 +48,7 @@ for (const key of REQUIRED_ENVS) {
 }
 
 // -------------------- DB SETUP --------------------
-const db = new sqlite3.Database("./tournament.sqlite");
+const db = new sqlite3.Database("/data/tournament.sqlite");
 
 function safeAlter(sql) {
   db.run(sql, () => {
@@ -770,3 +770,4 @@ client.on("interactionCreate", async (interaction) => {
 
 // -------------------- START BOT --------------------
 client.login(process.env.DISCORD_TOKEN);
+
