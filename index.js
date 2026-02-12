@@ -787,37 +787,36 @@ client.on("interactionCreate", async (interaction) => {
       const active = await getActiveTournament(interaction.guildId);
 
       if (interaction.customId === "set_channels") {
-        if (!isAdmin) return interaction.reply({ content: "❌ Admins only.", ephemeral: true });
+  if (!isAdmin) return interaction.reply({ content: "❌ Admins only.", ephemeral: true });
 
-        const modal = new ModalBuilder().setCustomId("set_channels_modal").setTitle("Set Channels");
+  const modal = new ModalBuilder().setCustomId("set_channels_modal").setTitle("Set Channels");
 
-        const panelInput = new TextInputBuilder()
-          .setCustomId("panel_ch")
-          .setLabel("Panel channel (paste #channel or channel ID)")
-          .setStyle(TextInputStyle.Short)
-          .setRequired(true);
+  const panelInput = new TextInputBuilder()
+    .setCustomId("panel_ch")
+    .setLabel("Panel channel (#channel or ID)")
+    .setStyle(TextInputStyle.Short)
+    .setRequired(true);
 
-        const lbInput = new TextInputBuilder()
-          .setCustomId("lb_ch")
-          .setLabel("Leaderboard channel (paste #channel or channel ID)")
-          .setStyle(TextInputStyle.Short)
-          .setRequired(true);
+  const lbInput = new TextInputBuilder()
+    .setCustomId("lb_ch")
+    .setLabel("Leaderboard channel (#channel or ID)")
+    .setStyle(TextInputStyle.Short)
+    .setRequired(true);
 
-        const resInput = new TextInputBuilder()
-          .setCustomId("res_ch")
-          .setLabel("Results channel (paste #channel or channel ID)")
-          .setStyle(TextInputStyle.Short)
-          .setRequired(true);
+  const resInput = new TextInputBuilder()
+    .setCustomId("res_ch")
+    .setLabel("Results channel (#channel or ID)")
+    .setStyle(TextInputStyle.Short)
+    .setRequired(true);
 
-        modal.addComponents(
-          new ActionRowBuilder().addComponents(panelInput),
-          new ActionRowBuilder().addComponents(lbInput),
-          new ActionRowBuilder().addComponents(resInput)
-        );
+  modal.addComponents(
+    new ActionRowBuilder().addComponents(panelInput),
+    new ActionRowBuilder().addComponents(lbInput),
+    new ActionRowBuilder().addComponents(resInput)
+  );
 
-        return interaction.showModal(modal);
-      }
-
+  return interaction.showModal(modal);
+}
       if (interaction.customId === "submit_weighin") {
         // Must be in panel channel (recommended)
         if (cfg?.panel_channel_id && interaction.channelId !== cfg.panel_channel_id) {
